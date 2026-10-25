@@ -32,7 +32,7 @@ and Scoop configuration untouched. A check-only mode performs no source changes.
   application, backups, future upstream drift, and verification boundaries.
 - [x] Run focused tests, parser/static checks, secret/path review, independent
   review, and idempotence/compatibility checks before publishing.
-- [ ] Create `LeeXieXie/scoop-local-extensions` as a public repository, push,
+- [x] Create `LeeXieXie/scoop-local-extensions` as a public repository, push,
   and verify GitHub contents and CI. Do not change the installed Scoop remote or
   its update configuration as a side effect of publication.
 
@@ -54,3 +54,15 @@ and Scoop configuration untouched. A check-only mode performs no source changes.
   DLL identified Explorer; this was diagnostics, not remediation of the live lock.
 - Remaining boundaries: file-symlink target behavior is unverified; Restart
   Manager/module calls are best effort and not individually interruptible.
+
+## Published Verification
+
+- Public repository: https://github.com/LeeXieXie/scoop-local-extensions .
+- Implementation commit: `09f3f50a664149aec7c74d5bb944780a63bfe093`.
+- [GitHub CI run 40218599245](https://github.com/LeeXieXie/scoop-local-extensions/actions/runs/40218599245)
+  passed on both Windows PowerShell and PowerShell. Each job fetched the exact
+  public upstream revision, applied the published bundle, verified idempotence,
+  and ran parser checks and regression tests.
+- The installed local source was separately checked as `AlreadyApplied` against
+  the published patch. Its original remote and update configuration were not
+  changed; no live cleanup or process termination was used for validation.
