@@ -1,0 +1,6 @@
+{
+  "repository": "https://github.com/ScoopInstaller/Scoop",
+  "revision": "e6aa3b366bdee8ed138c1e0f7b85192ebdd35d0f",
+  "version": "0.6.0",
+  "patch": "patches/local-extensions.patch"
+}

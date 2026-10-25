@@ -1,0 +1,67 @@
+name: Test Patch Bundle
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        shell: [powershell, pwsh]
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - name: Check out patch bundle
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+      - name: Fetch pinned public upstream into disposable source tree
+        env:
+          GIT_TERMINAL_PROMPT: '0'
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $metadata = Get-Content -LiteralPath './upstream.json' -Raw | ConvertFrom-Json
+          if ($metadata.repository -cne 'https://github.com/ScoopInstaller/Scoop' -or $metadata.revision -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'Invalid public upstream reference.'
+          }
+          $source = Join-Path $env:RUNNER_TEMP 'scoop-local-extensions-upstream'
+          if (Test-Path -LiteralPath $source) { throw 'Disposable source destination already exists.' }
+          git init --quiet $source
+          if ($LASTEXITCODE -ne 0) { throw 'Git initialization failed.' }
+          git -C $source config core.autocrlf false
+          if ($LASTEXITCODE -ne 0) { throw 'Git configuration failed.' }
+          git -C $source -c credential.helper= -c core.askPass= fetch --no-tags --depth=1 $metadata.repository $metadata.revision
+          if ($LASTEXITCODE -ne 0) { throw 'Public upstream fetch failed.' }
+          git -C $source checkout --quiet --detach FETCH_HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Pinned source checkout failed.' }
+          $actual = git -C $source rev-parse HEAD
+          if ($LASTEXITCODE -ne 0 -or $actual -cne $metadata.revision) { throw 'Upstream revision mismatch.' }
+      - name: Check, apply, and verify idempotence
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = Join-Path $env:RUNNER_TEMP 'scoop-local-extensions-upstream'
+          $before = git -C $source status --porcelain
+          if ($LASTEXITCODE -ne 0 -or $before) { throw 'Disposable source must start clean.' }
+          $check = ./scripts/Apply-LocalExtensions.ps1 -ScoopRoot $source -Check
+          if ($check.Status -ne 'Applicable' -or $check.BackupPath) { throw 'Check-only contract failed.' }
+          $after = git -C $source status --porcelain
+          if ($LASTEXITCODE -ne 0 -or $after) { throw 'Check-only changed the source.' }
+          $applied = ./scripts/Apply-LocalExtensions.ps1 -ScoopRoot $source
+          if ($applied.Status -ne 'Applied' -or -not $applied.BackupPath) { throw 'Application contract failed.' }
+          $again = ./scripts/Apply-LocalExtensions.ps1 -ScoopRoot $source
+          if ($again.Status -ne 'AlreadyApplied' -or $again.BackupPath) { throw 'Idempotence contract failed.' }
+          $final = ./scripts/Apply-LocalExtensions.ps1 -ScoopRoot $source -Check
+          if ($final.Status -ne 'AlreadyApplied') { throw 'Applied check-only contract failed.' }
+      - name: Run isolated regression tests and parser checks
+        run: |
+          $source = Join-Path $env:RUNNER_TEMP 'scoop-local-extensions-upstream'
+          ./scripts/Test-LocalExtensions.ps1 -ScoopRoot $source

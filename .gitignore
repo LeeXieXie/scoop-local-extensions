@@ -1,0 +1,9 @@
+.DS_Store
+TestResults.xml
+*.log
+.verification/
+.verification-source-path.txt
+.backups/
+.env
+config.json
+github-token
