@@ -1,0 +1,31 @@
+diff --git a/libexec/scoop-update.ps1 b/libexec/scoop-update.ps1
+index 839316ea..0a2f1014 100644
+--- a/libexec/scoop-update.ps1
++++ b/libexec/scoop-update.ps1
+@@ -14,7 +14,7 @@
+ #   -q, --quiet            Hide extraneous messages
+ #   -a, --all              Update all apps (alternative to '*')
+ #       --prefetch         Prepare and verify the whole batch without installing
+-#       --batch            Prepare every payload before stopping any app
++#   -b, --batch            Prepare every payload before stopping any app
+ #       --offline          Install only verified local manifests and cache
+ #       --restart          Relaunch eligible GUI apps actually stopped by update
+ 
+@@ -33,7 +33,7 @@ if (get_config USE_SQLITE_CACHE) {
+     . "$PSScriptRoot\..\lib\database.ps1"
+ }
+ 
+-$opt, $apps, $err = getopt $args 'gfiksqa' 'global', 'force', 'independent', 'no-cache', 'skip-hash-check', 'quiet', 'all', 'prefetch', 'batch', 'offline', 'restart'
++$opt, $apps, $err = getopt $args 'gfiksqab' 'global', 'force', 'independent', 'no-cache', 'skip-hash-check', 'quiet', 'all', 'prefetch', 'batch', 'offline', 'restart'
+ if ($err) { error "scoop update: $err"; exit 1 }
+ $global = $opt.g -or $opt.global
+ $force = $opt.f -or $opt.force
+@@ -45,7 +45,7 @@ $all = $opt.a -or $opt.all
+ $prefetch = $opt.prefetch
+ $offline = $opt.offline
+ $restart = $opt.restart
+-$preparedMode = $opt.batch -or $prefetch -or $offline
++$preparedMode = $opt.b -or $opt.batch -or $prefetch -or $offline
+ if ((($preparedMode -or $restart) -and (!$use_cache -or !$check_hash)) -or (($preparedMode -or $restart) -and !($apps -or $all))) {
+     error 'Prepared/restart options require apps; prepared updates require cache and hash verification.'
+     exit 1

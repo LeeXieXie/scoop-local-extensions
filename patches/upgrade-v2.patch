@@ -420,7 +420,7 @@ index 051d361e..fd8e1cbd 100644
      if ($opt.u -or $opt.'no-update-scoop') {
          warn "Scoop is out of date."
 diff --git a/libexec/scoop-update.ps1 b/libexec/scoop-update.ps1
-index ae6c5a57..839316ea 100644
+index ae6c5a57..0a2f1014 100644
 --- a/libexec/scoop-update.ps1
 +++ b/libexec/scoop-update.ps1
 @@ -13,6 +13,10 @@
@@ -428,7 +428,7 @@ index ae6c5a57..839316ea 100644
  #   -q, --quiet            Hide extraneous messages
  #   -a, --all              Update all apps (alternative to '*')
 +#       --prefetch         Prepare and verify the whole batch without installing
-+#       --batch            Prepare every payload before stopping any app
++#   -b, --batch            Prepare every payload before stopping any app
 +#       --offline          Install only verified local manifests and cache
 +#       --restart          Relaunch eligible GUI apps actually stopped by update
  
@@ -439,7 +439,7 @@ index ae6c5a57..839316ea 100644
  }
  
 -$opt, $apps, $err = getopt $args 'gfiksqa' 'global', 'force', 'independent', 'no-cache', 'skip-hash-check', 'quiet', 'all'
-+$opt, $apps, $err = getopt $args 'gfiksqa' 'global', 'force', 'independent', 'no-cache', 'skip-hash-check', 'quiet', 'all', 'prefetch', 'batch', 'offline', 'restart'
++$opt, $apps, $err = getopt $args 'gfiksqab' 'global', 'force', 'independent', 'no-cache', 'skip-hash-check', 'quiet', 'all', 'prefetch', 'batch', 'offline', 'restart'
  if ($err) { error "scoop update: $err"; exit 1 }
  $global = $opt.g -or $opt.global
  $force = $opt.f -or $opt.force
@@ -450,7 +450,7 @@ index ae6c5a57..839316ea 100644
 +$prefetch = $opt.prefetch
 +$offline = $opt.offline
 +$restart = $opt.restart
-+$preparedMode = $opt.batch -or $prefetch -or $offline
++$preparedMode = $opt.b -or $opt.batch -or $prefetch -or $offline
 +if ((($preparedMode -or $restart) -and (!$use_cache -or !$check_hash)) -or (($preparedMode -or $restart) -and !($apps -or $all))) {
 +    error 'Prepared/restart options require apps; prepared updates require cache and hash verification.'
 +    exit 1

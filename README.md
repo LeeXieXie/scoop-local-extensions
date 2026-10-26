@@ -11,7 +11,7 @@
 4. **修改操作互斥**：有副作用的 Scoop 命令串行进入，超时报告持锁进程而不是强杀；帮助、查询及 `cleanup --dry-run` 不等待写锁。
 5. **清理保留与预演**：`--keep N` 保留当前版本及最近安装的 N-1 个旧版本；`--dry-run` 只展示删除/保留计划，不修改联接、属性、缓存或应用文件。
 6. **Git 网络超时与失败汇总**：给 clone/fetch/pull/ls-remote 设置可配置的时间上限；单个 bucket 失败不妨碍其他 bucket 检查，但不会把不完整同步报告成成功。
-7. **批量准备与预下载**：`update --prefetch` 只准备本批更新；`update --batch` 在所有目标及缺失依赖下载校验通过后，再串行执行更新。
+7. **批量准备与预下载**：`update --prefetch` 只准备本批更新；`update -b`（也可用 `--batch`）在所有目标及缺失依赖下载校验通过后，再串行执行更新。
 8. **缓存离线安装/更新**：`install --offline` / `update --offline` 使用本地清单及已校验缓存；缺少文件、无哈希或存在不允许的安装脚本时，在改变应用前拒绝执行。
 9. **显式更新后恢复**：`update --restart` 仅在成功后尝试重新启动本次确实停止且符合策略的普通 GUI 主程序，不恢复系统进程、服务、参数或工作会话。
 
@@ -124,15 +124,19 @@ scoop config git_network_timeout 120
 scoop update '*' --prefetch
 
 # 整批文件全部下载校验成功后，才开始逐个更新。
-scoop update '*' --batch
+scoop update '*' -b
+# 等价简写：-a 表示全部应用，-b 表示整批准备。
+scoop update -ab
 
 # 使用当前本地 bucket 清单和缓存，不同步 Scoop/bucket，不下载缺失文件。
 scoop update '*' --offline
 scoop install personal/example-portable --offline
 
 # 显式要求在成功更新后恢复本次实际停止的合格 GUI 主程序。
-scoop update magpie-ai --batch --restart
+scoop update magpie-ai -b --restart
 ```
+
+`-b` 与 `--batch` 完全等价；`-ab` 等价于 `'*' -b`。已安装早期 0.3.0、仅缺少短参数的用户，可在审核后用 [`upgrade-v3-batch-alias.patch`](patches/upgrade-v3-batch-alias.patch) 做单文件增量更新：先对目标 Scoop 执行 `git apply --check`，再应用；之后用本库 `-Check` 核对完整状态并提交目标仓库中的修改。
 
 `example-portable` 只是语法示例，需替换为真实、符合离线策略且已缓存的包。预下载不是导出包，也不会把所有历史版本下载到缓存。准备阶段固定本次的清单、版本、来源与架构；缺失依赖也必须先就绪，不能在关闭应用后才临时联网。安装仍串行，某个安装失败时不承诺整批原子性或自动回滚。
 

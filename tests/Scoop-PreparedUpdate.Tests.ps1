@@ -1,3 +1,56 @@
+Describe 'Batch short option parsing' {
+    BeforeEach {
+        function Read-UpdateOptions {
+            param([string[]]$Options)
+            $root = $env:SCOOP_LOCAL_EXTENSIONS_SOURCE
+            $text = [IO.File]::ReadAllText((Join-Path $root 'libexec/scoop-update.ps1'))
+            $start = $text.IndexOf('$opt, $apps, $err = getopt')
+            $end = $text.IndexOf('# load config', $start)
+            if ($start -lt 0 -or $end -le $start) { throw 'Update option parser was not found.' }
+            $parser = $text.Substring($start, $end - $start).Replace('exit 1', "throw 'Invalid update options'")
+            $getopt = [IO.File]::ReadAllText((Join-Path $root 'lib/getopt.ps1'))
+            $fixture = New-Module -ScriptBlock {
+                function Invoke-Parser {
+                    param($GetoptSource, $ParserSource, $Options)
+                    function error {}
+                    . ([scriptblock]::Create($GetoptSource))
+                    . ([scriptblock]::Create($ParserSource)) @Options
+                    [pscustomobject]@{ Prepared = [bool]$preparedMode; All = [bool]$all; Apps = @($apps) }
+                }
+            }
+            try {
+                & $fixture { param($GetoptSource, $ParserSource, $Options)
+                    Invoke-Parser $GetoptSource $ParserSource $Options
+                } $getopt $parser $Options
+            } finally { Remove-Module $fixture -ErrorAction SilentlyContinue }
+        }
+    }
+
+    It 'enables the same batch mode through short, long and clustered options (<Mode>)' -TestCases @(
+        @{ Mode = '-b'; Options = @('*', '-b'); All = $false },
+        @{ Mode = '--batch'; Options = @('*', '--batch'); All = $false },
+        @{ Mode = '-ab'; Options = @('-ab'); All = $true }
+    ) {
+        param($Mode, $Options, $All)
+        $result = Read-UpdateOptions $Options
+        if (!$result.Prepared -or $result.All -ne $All) { throw "Batch option did not select the expected mode: $Mode" }
+        if (!$All -and ($result.Apps -join ',') -ne '*') { throw 'The short option changed the application arguments.' }
+    }
+
+    It 'keeps hash and cache bypass guards for the short alias (<Option>)' -TestCases @(
+        @{ Option = '-bk' }, @{ Option = '-bs' }
+    ) {
+        param($Option)
+        $rejected = $false
+        try { Read-UpdateOptions @('*', $Option) | Out-Null } catch { $rejected = $true }
+        if (!$rejected) { throw "Batch safety guard was bypassed: $Option" }
+    }
+
+    It 'leaves ordinary update mode unchanged without a batch option' {
+        if ((Read-UpdateOptions @('*')).Prepared) { throw 'Batch mode must remain opt-in.' }
+    }
+}
+
 Describe 'Frozen prepared updates' {
     BeforeEach {
         $sourceRoot = $env:SCOOP_LOCAL_EXTENSIONS_SOURCE
