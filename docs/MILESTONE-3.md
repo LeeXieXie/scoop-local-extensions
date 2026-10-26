@@ -56,7 +56,7 @@ ordered list and performs read-only validation only.
 - [x] Exercise all regressions on PS5.1/PS7 and regenerate exact source artifacts.
 - [x] Review unsafe restart targets, offline escape paths, hashes and frozen plans.
 - [x] Commit installed changes and verify its worktree remains clean.
-- [ ] Publish code/docs and verify fresh and recognized-upgrade CI paths.
+- [x] Publish code/docs and verify fresh and recognized-upgrade CI paths.
 
 ## Verification Notes
 
@@ -77,3 +77,6 @@ ordered list and performs read-only validation only.
   only strict offline execution rejects hooks and dynamic environment expansion.
 - Public credential/private-path scans, all eight runtime patch postimage hashes,
   parser checks, Markdown links, and workflow YAML validation passed.
+- Public implementation commit: `161ffe8`. [GitHub Actions run 40272123745](https://github.com/LeeXieXie/scoop-local-extensions/actions/runs/40272123745)
+  passed on both PowerShell engines. Each engine ran 195/195 tests on fresh
+  upstream, after the v1 upgrade and after the 0.2.0 upgrade: six passing suites.
