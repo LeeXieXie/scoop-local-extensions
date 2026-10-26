@@ -38,6 +38,23 @@ $scoopRoot = scoop prefix scoop
 
 `-ScoopRoot` 必须指向实际的 Git 源码目录；如果 `scoop prefix scoop` 返回的路径或其父目录是 Junction / 符号链接，请先核对目标，再改用其物理路径。脚本会拒绝通过重解析点修改源码，不自动绕过此检查。
 
+### 保存目标 Scoop 仓库中的修改
+
+应用脚本只修改四个源码文件，**不会自动创建 Git 提交**。补丁仓库已经推送到 GitHub，不等于目标 Scoop 仓库中的修改也已提交；默认 Scoop 遇到未提交的源码变更会提示 `Uncommitted changes detected. Update aborted.` 并拒绝自更新。
+
+先检查差异，确认要保留的本地修改，再在目标 Scoop 仓库提交。不要在未审核的情况下提交其他文件：
+
+```powershell
+git -C $scoopRoot status --short
+git -C $scoopRoot diff -- lib/install.ps1 libexec/scoop-config.ps1 libexec/scoop-update.ps1 libexec/scoop-cleanup.ps1
+git -C $scoopRoot add -- lib/install.ps1 libexec/scoop-config.ps1 libexec/scoop-update.ps1 libexec/scoop-cleanup.ps1
+git -C $scoopRoot commit -m "Keep reviewed local extensions during Scoop updates" -m "Scope-risk: moderate"
+```
+
+提交后确认 `git -C $scoopRoot diff HEAD --name-only` 没有输出。正常同源、同分支更新会通过 Git pull 保留本地提交；未来仍可能发生需要人工审核的合并冲突。不要为了消除提示而丢弃修改或把扩展临时藏入 stash。
+
+**不要把 `SCOOP_REPO` 设置为本补丁仓库**，这里不是完整 Scoop 源码。更换 Scoop 更新源或分支可能触发其重置路径，应另行备份和审核。
+
 应用脚本不更改 Scoop 的配置、远程仓库或更新通道，也不安装、更新、卸载或清理任何应用。
 如果需要自动结束目标应用进程，由用户另行显式启用：
 

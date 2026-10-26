@@ -22,6 +22,12 @@ Source backups precede application. A check-only invocation does not modify the
 target. Installation configuration, remotes, update channels, and applications
 are never changed by this script.
 
+Application deliberately leaves source changes uncommitted for human review.
+Scoop's own updater rejects tracked uncommitted changes by default, so the user
+must review and commit the four source paths in the target Scoop repository.
+Publishing this bundle is not a substitute for that local commit. The bundle
+repository is not a valid replacement for the complete Scoop update source.
+
 ## Runtime Boundaries
 
 Process termination remains opt-in and limited to the original target-app guard.
