@@ -51,7 +51,7 @@ idempotence. Keep the pinned Scoop v0.6.0 upstream reference unchanged.
 - [x] Review destructive-path, lock, process-tree, exit-status and privacy risks.
 - [x] Verify generated artifacts on disposable pinned upstream trees.
 - [x] Commit installed local changes so Scoop self-update is not blocked by dirt.
-- [ ] Update README/design and publish the public repository; verify both CI jobs.
+- [x] Update README/design and publish the public repository; verify both CI jobs.
 
 All recursive fixture cleanup must verify its resolved absolute temporary path.
 No automatic Explorer restart, service shutdown, ACL mutation, stash, hard reset,
@@ -78,3 +78,7 @@ or external network failure is used as a destructive verification shortcut.
 - Installed source is committed locally as `ee08b567`; its worktree is clean,
   official Scoop update source is unchanged, and bundle verification returns
   `AlreadyApplied` for version `0.2.0`.
+- Public implementation commit: `01e8fcb`. [GitHub CI run 40264765547](https://github.com/LeeXieXie/scoop-local-extensions/actions/runs/40264765547)
+  passed on both Windows PowerShell and PowerShell. Each shell passed 127/127
+  tests on a fresh pinned source and another 127/127 after a recognized v1 upgrade.
+  Full-patch/upgrade preflight and repeated-application checks passed in both jobs.
