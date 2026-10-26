@@ -1,0 +1,17 @@
+diff --git a/lib/install.ps1 b/lib/install.ps1
+index 91a2e05f..33df3690 100644
+--- a/lib/install.ps1
++++ b/lib/install.ps1
+@@ -158,7 +158,11 @@ function install_app($app, $architecture, $global, $suggested, $use_cache = $tru
+             $null = Assert-ScoopPreparedPayload $Prepared
+             $payloadName = url_filename $payloadUrl
+             Copy-Item -LiteralPath (cache_path $app $version $payloadUrl) -Destination (Join-Path $dir $payloadName) -ErrorAction Stop
+-            $valid, $message = check_hash (Join-Path $dir $payloadName) (hash_for_url $manifest $payloadUrl $architecture) (show_app $app $bucket)
++            # The legacy hash diagnostic reads the caller's payload $url.
++            $valid, $message = & {
++                param($url)
++                check_hash (Join-Path $dir $payloadName) (hash_for_url $manifest $payloadUrl $architecture) (show_app $app $bucket)
++            } $payloadUrl
+             if (!$valid) { throw "Prepared payload changed: $message" }
+             $fname += $payloadName
+         }

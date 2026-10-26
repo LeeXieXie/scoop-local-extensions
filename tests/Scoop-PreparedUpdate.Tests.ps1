@@ -379,6 +379,62 @@ Describe 'Frozen prepared updates' {
             $script:ScoopRestartExecutables = @()
         }
     }
+    It 'uses the actual payload URL for real hash diagnostics without changing manifest-source metadata (<Label>)' -TestCases @(
+        @{ Label = 'bucket'; ManifestSource = $null },
+        @{ Label = 'local manifest'; ManifestSource = 'C:\fixture\parent.json' }
+    ) {
+        param($Label, $ManifestSource)
+        foreach ($file in @('lib/download.ps1', 'lib/manifest.ps1')) {
+            $ast = [System.Management.Automation.Language.Parser]::ParseFile((Join-Path $sourceRoot $file), [ref]$null, [ref]$null)
+            foreach ($definition in $ast.FindAll({ param($node)
+                    $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and
+                    $node.Name -in @('check_hash', 'url_remote_filename', 'get_hash', 'hash', 'arch_specific', 'save_install_info')
+                }, $false)) { . ([scriptblock]::Create($definition.Extent.Text)) }
+        }
+        function script:url($Manifest, $Architecture) { arch_specific 'url' $Manifest $Architecture }
+        $payloadUrl = 'https://example.invalid/releases/payload-original.exe#/app.exe'
+        $cacheFile = cache_path 'parent' '2' $payloadUrl
+        [IO.File]::WriteAllText($cacheFile, 'controlled prepared executable bytes; never executed')
+        $manifest = [pscustomobject]@{
+            version = '2'
+            architecture = [pscustomobject]@{
+                '64bit' = [pscustomobject]@{ url = $payloadUrl; hash = (Get-FileHash -LiteralPath $cacheFile -Algorithm SHA256).Hash }
+            }
+        }
+        $entry = [pscustomobject]@{ App = 'parent'; Spec = 'main/parent'; Manifest = $manifest; Bucket = 'main'; Source = $ManifestSource; Architecture = '64bit'; Version = '2'; Offline = $false }
+        $entry | Add-Member NoteProperty Identity (@($entry.App, $entry.Spec, $entry.Bucket, $entry.Source, $entry.Architecture, $entry.Version, ($entry.Manifest | ConvertTo-Json -Depth 100 -Compress)) -join "`n")
+        $script:hashMessages = @()
+        function Write-Host { $script:hashMessages += ($args -join ' ') }
+        function Get-Manifest { throw 'Prepared installation resolved a new manifest.' }
+        function save_installed_manifest { throw 'Prepared installation refetched manifest content.' }
+        function Invoke-ScoopDownload { throw 'Prepared installation used a downloader.' }
+        function versiondir($App, $Version) { Join-Path $appRoot ($App + '/' + $Version) }
+        function ensure($Path) { New-Item -Path $Path -ItemType Directory -Force | Out-Null; $Path }
+        function persistdir { Join-Path $TestDrive 'persist' }
+        function Invoke-Extraction {}
+        function Invoke-HookScript {}
+        function Invoke-Installer {}
+        function ensure_install_dir_not_in_path {}
+        function link_current($Path) { $Path }
+        function create_shims {}
+        function create_startmenu_shortcuts {}
+        function install_psmodule {}
+        function env_add_path {}
+        function env_set {}
+        function persist_data {}
+        function persist_permission {}
+        function ConvertToPrettyJson { param([Parameter(ValueFromPipeline)]$Value) process { $Value | ConvertTo-Json -Depth 100 } }
+        function Out-UTF8File { param($Path, [Parameter(ValueFromPipeline)]$Value) process { [IO.File]::WriteAllText($Path, $Value) } }
+        function show_notes {}
+        install_app 'parent' '64bit' $false @{} $true $true $entry | Out-Null
+        if (($script:hashMessages -join ' ') -notmatch 'payload-original\.exe') { throw 'Hash diagnostics did not identify the payload URL.' }
+        $info = Get-Content -LiteralPath (Join-Path $appRoot 'parent/2/scoop-install.json') -Raw | ConvertFrom-Json
+        if ($ManifestSource) {
+            if ($info.url -ne $ManifestSource) { throw 'Hash validation overwrote the manifest-source metadata.' }
+        } elseif ($info.PSObject.Properties['url']) { throw 'A bucket install acquired an unrelated payload URL as its source.' }
+        if ($entry.Source -ne $ManifestSource) { throw 'The frozen entry source changed during hash validation.' }
+    }
+
     It 'installs frozen manifest content directly with no metadata refetch or downloader' {
         $null = Add-FixtureManifest 'parent'
         $entry = @(New-ScoopUpdatePlan (,@('parent', $false)) $false $true $false)[0]

@@ -721,7 +721,7 @@ index 326d9d81..59e37a0b 100644
      $urls = @(script:url $manifest $architecture)
  
 diff --git a/lib/install.ps1 b/lib/install.ps1
-index 7b242278..91a2e05f 100644
+index 7b242278..33df3690 100644
 --- a/lib/install.ps1
 +++ b/lib/install.ps1
 @@ -1,3 +1,93 @@
@@ -841,7 +841,7 @@ index 7b242278..91a2e05f 100644
  
      if (!$manifest) {
          abort "Couldn't find manifest for '$app'$(if ($bucket) { " from '$bucket' bucket" } elseif ($url) { " at '$url'" })."
-@@ -49,7 +151,20 @@ function install_app($app, $architecture, $global, $suggested, $use_cache = $tru
+@@ -49,7 +151,24 @@ function install_app($app, $architecture, $global, $suggested, $use_cache = $tru
      $original_dir = $dir # keep reference to real (not linked) directory
      $persist_dir = persistdir $app $global
  
@@ -853,7 +853,11 @@ index 7b242278..91a2e05f 100644
 +            $null = Assert-ScoopPreparedPayload $Prepared
 +            $payloadName = url_filename $payloadUrl
 +            Copy-Item -LiteralPath (cache_path $app $version $payloadUrl) -Destination (Join-Path $dir $payloadName) -ErrorAction Stop
-+            $valid, $message = check_hash (Join-Path $dir $payloadName) (hash_for_url $manifest $payloadUrl $architecture) (show_app $app $bucket)
++            # The legacy hash diagnostic reads the caller's payload $url.
++            $valid, $message = & {
++                param($url)
++                check_hash (Join-Path $dir $payloadName) (hash_for_url $manifest $payloadUrl $architecture) (show_app $app $bucket)
++            } $payloadUrl
 +            if (!$valid) { throw "Prepared payload changed: $message" }
 +            $fname += $payloadName
 +        }
@@ -863,7 +867,7 @@ index 7b242278..91a2e05f 100644
      Invoke-Extraction -Path $dir -Name $fname -Manifest $manifest -ProcessorArchitecture $architecture
      Invoke-HookScript -HookType 'pre_install' -Manifest $manifest -ProcessorArchitecture $architecture
  
-@@ -69,7 +184,11 @@ function install_app($app, $architecture, $global, $suggested, $use_cache = $tru
+@@ -69,7 +188,11 @@ function install_app($app, $architecture, $global, $suggested, $use_cache = $tru
      Invoke-HookScript -HookType 'post_install' -Manifest $manifest -ProcessorArchitecture $architecture
  
      # save info for uninstall
@@ -876,7 +880,7 @@ index 7b242278..91a2e05f 100644
      save_install_info @{ 'architecture' = $architecture; 'url' = $url; 'bucket' = $bucket } $dir
  
      if ($manifest.suggest) {
-@@ -532,16 +651,38 @@ function persist_permission($manifest, $global) {
+@@ -532,16 +655,38 @@ function persist_permission($manifest, $global) {
  # test if there are running processes
  function test_running_process($app, $global) {
      $processdir = appdir $app $global | Convert-Path
