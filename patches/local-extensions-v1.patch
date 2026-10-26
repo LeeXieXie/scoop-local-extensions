@@ -1,0 +1,429 @@
+diff --git a/lib/install.ps1 b/lib/install.ps1
+index 7b242278..573821c7 100644
+--- a/lib/install.ps1
++++ b/lib/install.ps1
+@@ -532,16 +532,30 @@ function persist_permission($manifest, $global) {
+ # test if there are running processes
+ function test_running_process($app, $global) {
+     $processdir = appdir $app $global | Convert-Path
+-    $running_processes = Get-Process | Where-Object { $_.Path -like "$processdir\*" } | Out-String
++    $processPrefix = $processdir.TrimEnd('\', '/') + '\'
++    $running_processes = @(Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($processPrefix, [StringComparison]::OrdinalIgnoreCase) })
+ 
+     if ($running_processes) {
++        if (get_config KILL_RUNNING_PROCESSES) {
++            warn "The following instances of `"$app`" are still running. Scoop is configured to stop them."
++            Write-Host ($running_processes | Out-String)
++            $running_processes | Stop-Process -Force -ErrorAction Stop
++            $running_processes | Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
++            $remaining_processes = @(Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($processPrefix, [StringComparison]::OrdinalIgnoreCase) })
++            if (!$remaining_processes) {
++                return $false
++            }
++            error "The following instances of `"$app`" are still running after stop attempt. Close them and try again."
++            Write-Host ($remaining_processes | Out-String)
++            return $true
++        }
+         if (get_config IGNORE_RUNNING_PROCESSES) {
+             warn "The following instances of `"$app`" are still running. Scoop is configured to ignore this condition."
+-            Write-Host $running_processes
++            Write-Host ($running_processes | Out-String)
+             return $false
+         } else {
+             error "The following instances of `"$app`" are still running. Close them and try again."
+-            Write-Host $running_processes
++            Write-Host ($running_processes | Out-String)
+             return $true
+         }
+     } else {
+diff --git a/libexec/scoop-cleanup.ps1 b/libexec/scoop-cleanup.ps1
+index 3ea5194d..766d193f 100644
+--- a/libexec/scoop-cleanup.ps1
++++ b/libexec/scoop-cleanup.ps1
+@@ -27,38 +27,307 @@ if ($global -and !(is_admin)) {
+     error 'you need admin rights to cleanup global apps'; exit 1
+ }
+ 
++function Get-CleanupPath($path) {
++    if (![IO.Path]::IsPathRooted($path)) { throw "Cleanup requires an absolute filesystem path: $path" }
++    [IO.Path]::GetFullPath($path).TrimEnd('\', '/')
++}
++
++function Assert-CleanupVersionPath($dir, $appDir, $currentVersion) {
++    $path = Get-CleanupPath $dir
++    $parent = Get-CleanupPath $appDir
++    if ((Split-Path $path -Parent) -ne $parent -or (Split-Path $path -Leaf) -eq 'current' -or
++        !$currentVersion -or (Split-Path $path -Leaf) -eq $currentVersion) {
++        throw "Refusing unsafe or current version path: $path"
++    }
++    $ancestor = $path
++    while ($ancestor) {
++        $item = Get-Item -LiteralPath $ancestor -Force -ErrorAction Stop
++        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Refusing a version path through a link: $ancestor" }
++        $ancestor = Split-Path $ancestor -Parent
++    }
++    $current = Get-Item -LiteralPath (Join-Path $parent 'current') -Force -ErrorAction SilentlyContinue
++    for ($depth = 0; $current -and ($current.Attributes -band [IO.FileAttributes]::ReparsePoint); $depth++) {
++        if ($depth -ge 32 -or !$current.Target -or @($current.Target).Count -ne 1) { throw 'Cannot safely resolve the current version link.' }
++        $target = [string]@($current.Target)[0]
++        if (![IO.Path]::IsPathRooted($target)) { $target = Join-Path (Split-Path $current.FullName -Parent) $target }
++        $target = Get-CleanupPath $target
++        if ($path -eq $target) { throw "Refusing the current link target: $path" }
++        $ancestor = Split-Path $target -Parent
++        while ($ancestor) {
++            $item = Get-Item -LiteralPath $ancestor -Force -ErrorAction Stop
++            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Cannot safely resolve the current target through a parent link: $ancestor" }
++            $ancestor = Split-Path $ancestor -Parent
++        }
++        $current = Get-Item -LiteralPath $target -Force -ErrorAction Stop
++    }
++    $path
++}
++
++function Unlink-CleanupData($manifest, $dir) {
++    foreach ($definition in @($manifest.persist)) {
++        if (!$definition) { continue }
++        $source, $null = persist_def $definition
++        $persistPath = Get-CleanupPath (Join-Path $dir $source)
++        if (!$persistPath.StartsWith($dir + '\', [StringComparison]::OrdinalIgnoreCase) -or
++            [Management.Automation.WildcardPattern]::ContainsWildcardCharacters($source)) {
++            throw "Refusing unsafe persist path: $source"
++        }
++        $persistItem = Get-Item -LiteralPath $persistPath -Force -ErrorAction SilentlyContinue
++        if ($persistItem -and !$persistItem.PSIsContainer -and ($persistItem.Attributes -band [IO.FileAttributes]::ReadOnly)) {
++            throw "Refusing to clear a potentially shared read-only persisted file attribute: $persistPath"
++        }
++    }
++    $pending = New-Object 'Collections.Generic.Stack[string]'
++    $pending.Push($dir)
++    while ($pending.Count) {
++        foreach ($item in Get-ChildItem -LiteralPath $pending.Pop() -Force -ErrorAction Stop) {
++            if (!$item.PSIsContainer) {
++                if ($item.LinkType -eq 'HardLink' -and ($item.Attributes -band [IO.FileAttributes]::ReadOnly)) {
++                    throw "Refusing to clear the shared read-only attribute of a hardlinked file: $($item.FullName)"
++                }
++                continue
++            }
++            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
++                if ($item.Attributes -band [IO.FileAttributes]::ReadOnly) {
++                    attrib -R /L $item.FullName
++                    if ($LASTEXITCODE) { throw "Cannot clear the junction's read-only attribute: $($item.FullName)" }
++                }
++                [IO.Directory]::Delete($item.FullName)
++            } else {
++                $pending.Push($item.FullName)
++            }
++        }
++    }
++    unlink_persist_data $manifest $dir
++}
++
++function Get-CleanupRestartManagerOwners($files) {
++    if (!('ScoopCleanup.Native.RestartManager' -as [type])) {
++        Add-Type -ErrorAction Stop -TypeDefinition @'
++using System;
++using System.ComponentModel;
++using System.Runtime.InteropServices;
++using System.Text;
++namespace ScoopCleanup.Native {
++    public sealed class Owner {
++        public int ProcessId;
++        public long StartTime;
++        public string AppName;
++        public string ServiceName;
++        public int AppType;
++    }
++    public static class RestartManager {
++        [StructLayout(LayoutKind.Sequential)]
++        private struct UniqueProcess { public uint ProcessId; public System.Runtime.InteropServices.ComTypes.FILETIME StartTime; }
++        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
++        private struct ProcessInfo {
++            public UniqueProcess Process;
++            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string AppName;
++            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string ServiceName;
++            public int AppType;
++            public uint AppStatus;
++            public uint SessionId;
++            [MarshalAs(UnmanagedType.Bool)] public bool Restartable;
++        }
++        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
++        private static extern int RmStartSession(out uint handle, uint flags, StringBuilder key);
++        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
++        private static extern int RmRegisterResources(uint handle, uint fileCount, string[] files,
++            uint processCount, UniqueProcess[] processes, uint serviceCount, string[] services);
++        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
++        private static extern int RmGetList(uint handle, out uint needed, ref uint count,
++            [In, Out] ProcessInfo[] processes, ref uint reasons);
++        [DllImport("rstrtmgr.dll")]
++        private static extern int RmEndSession(uint handle);
++        private static void Check(int code) {
++            if (code != 0) throw new Win32Exception(code, "Restart Manager error " + code + ": " + new Win32Exception(code).Message);
++        }
++        public static Owner[] FindOwners(string[] files) {
++            uint handle;
++            Check(RmStartSession(out handle, 0, new StringBuilder(33)));
++            try {
++                Check(RmRegisterResources(handle, (uint)files.Length, files, 0, null, 0, null));
++                uint needed, count = 0, reasons = 0;
++                int code = RmGetList(handle, out needed, ref count, null, ref reasons);
++                if (code == 0) return new Owner[0];
++                if (code != 234) Check(code);
++                for (int attempt = 0; attempt < 2; attempt++) {
++                    if (needed > 256) throw new InvalidOperationException("Restart Manager owner limit exceeded (256).");
++                    ProcessInfo[] entries = new ProcessInfo[needed];
++                    count = needed;
++                    code = RmGetList(handle, out needed, ref count, entries, ref reasons);
++                    if (code == 234) continue;
++                    Check(code);
++                    Owner[] owners = new Owner[count];
++                    for (int index = 0; index < count; index++) {
++                        ProcessInfo entry = entries[index];
++                        owners[index] = new Owner {
++                            ProcessId = (int)entry.Process.ProcessId,
++                            StartTime = ((long)(uint)entry.Process.StartTime.dwHighDateTime << 32) | (uint)entry.Process.StartTime.dwLowDateTime,
++                            AppName = entry.AppName, ServiceName = entry.ServiceName, AppType = entry.AppType
++                        };
++                    }
++                    return owners;
++                }
++                Check(code);
++                return new Owner[0];
++            } finally { RmEndSession(handle); }
++        }
++    }
++}
++'@ | Out-Null
++    }
++    [ScoopCleanup.Native.RestartManager]::FindOwners([string[]]$files)
++}
++
++function Get-CleanupFailureFiles($path, $failure) {
++    $files = New-Object 'Collections.Generic.List[string]'
++    $target = $failure.TargetObject
++    if ($target -is [IO.FileSystemInfo]) { $target = $target.FullName }
++    if ($target -is [string] -and $target) {
++        try {
++            if (![IO.Path]::IsPathRooted($target)) { $target = Join-Path $path $target }
++            $target = Get-CleanupPath $target
++            if ($target.StartsWith($path + '\', [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $target -PathType Leaf)) { $files.Add($target) }
++        } catch { }
++    }
++    $pending = New-Object 'Collections.Generic.Stack[string]'
++    $pending.Push($path)
++    $visited = 0
++    while ($pending.Count -and $files.Count -lt 32 -and $visited -lt 256) {
++        $directory = $pending.Pop()
++        try {
++            $entry = Get-Item -LiteralPath $directory -Force -ErrorAction Stop
++            if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
++            foreach ($entryPath in [IO.Directory]::EnumerateFileSystemEntries($directory)) {
++                $visited++
++                $item = Get-Item -LiteralPath $entryPath -Force -ErrorAction Stop
++                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
++                if ($item.PSIsContainer) { $pending.Push($item.FullName) }
++                elseif (!$files.Contains($item.FullName)) { $files.Add($item.FullName) }
++                if ($files.Count -ge 32 -or $visited -ge 256) { break }
++            }
++        } catch { }
++    }
++    $files.ToArray()
++}
++
++function Write-CleanupOwner($owner) {
++    $name = $owner.AppName
++    $executable = 'unavailable'
++    $validated = $false
++    try {
++        $process = Get-Process -Id $owner.ProcessId -ErrorAction Stop
++        if ($process.StartTime.ToFileTimeUtc() -eq $owner.StartTime) {
++            $validated = $true
++            $name = $process.ProcessName
++            try { if ($process.Path) { $executable = $process.Path } } catch { }
++        }
++    } catch { }
++    warn "Possible owner via Restart Manager: PID $($owner.ProcessId); Process: $name; Executable: $executable; Application: $($owner.AppName); Service: $($owner.ServiceName)."
++    if (!$validated) {
++        warn 'The PID/start time could not be verified (the process may have exited or the PID may have been reused); no termination command is suggested.'
++    } elseif ($owner.ServiceName -or $owner.AppType -in @(3, 1000) -or $name -in @('System', 'Idle', 'Registry', 'Secure System', 'smss', 'csrss', 'wininit', 'winlogon', 'lsass', 'services', 'svchost')) {
++        warn 'This is a service or critical system process. No termination command is suggested; use the application/service management UI if appropriate.'
++    } else {
++        if ($owner.AppType -eq 4 -or $name -eq 'explorer') { warn 'Explorer provides the desktop and taskbar; stopping it interrupts the desktop session.' }
++        warn "Save work and close the application normally first. Optional manual command (not executed; re-check the PID before use): Stop-Process -Id $($owner.ProcessId)"
++    }
++}
++
++function Write-CleanupFailure($app, $version, $path, $failure, $inspectOwners = $false) {
++    $script:cleanupFailures++
++    warn "Cleanup failed for $app ($version), path '$path': $($failure.Exception.Message)"
++    if (!$inspectOwners) { return }
++    $files = @(Get-CleanupFailureFiles $path $failure)
++    $reason = 'No readable remaining files were found within the bounded scan (32 files / 256 entries).'
++    if ($files.Count) {
++        try {
++            $nativeOwners = @(Get-CleanupRestartManagerOwners $files)
++            if ($nativeOwners.Count) {
++                foreach ($owner in $nativeOwners) { Write-CleanupOwner $owner }
++                return
++            }
++            $reason = "Restart Manager returned no owners for $($files.Count) file(s)."
++        } catch { $reason = $_.Exception.Message }
++    }
++    $owners = @()
++    $timer = [Diagnostics.Stopwatch]::StartNew()
++    $inspected = 0
++    try {
++        foreach ($process in Get-Process -ErrorAction Stop) {
++            if ($inspected -ge 128 -or $timer.ElapsedMilliseconds -ge 2000) { break }
++            $inspected++
++            try {
++                foreach ($module in $process.Modules) {
++                    if ($timer.ElapsedMilliseconds -ge 2000) { break }
++                    if ($module.FileName.StartsWith($path + '\', [StringComparison]::OrdinalIgnoreCase)) {
++                        $executable = 'unavailable'
++                        try { if ($process.Path) { $executable = $process.Path } } catch { }
++                        $owners += "$($process.ProcessName) (PID $($process.Id)); Executable: $executable"
++                        break
++                    }
++                }
++            } catch { }
++        }
++    } catch { }
++    warn "Exact file owner unknown: $reason File locks, permissions, or other errors may prevent deletion."
++    if ($owners) { warn "Possible owners via loaded modules (not proof of a lock; no kill advice): $($owners -join ', ')" }
++}
++
+ function cleanup($app, $global, $verbose, $cache) {
+     $current_version = Select-CurrentVersion -AppName $app -Global:$global
+     if ($cache) {
+-        Remove-Item "$cachedir\$app#*" -Exclude "$app#$current_version#*"
++        try { Remove-Item "$cachedir\$app#*" -Exclude "$app#$current_version#*" -ErrorAction Stop }
++        catch { Write-CleanupFailure $app 'cache' "$cachedir\$app#*" $_ }
+     }
+     $appDir = appdir $app $global
+-    $versions = Get-ChildItem $appDir -Name
++    $versions = Get-ChildItem -LiteralPath $appDir -Name -ErrorAction Stop
+     $versions = $versions | Where-Object { $current_version -ne $_ -and $_ -ne 'current' }
+     if (!$versions) {
+         if ($verbose) { success "$app is already clean" }
+         return
+     }
+ 
+-    Write-Host -f yellow "Removing $app`:" -NoNewline
++    Write-Host -f yellow "Removing ${app}:" -NoNewline
+     $versions | ForEach-Object {
+         $version = $_
+         Write-Host " $version" -NoNewline
+-        $dir = versiondir $app $version $global
+-        # unlink all potential old link before doing recursive Remove-Item
+-        unlink_persist_data (installed_manifest $app $version $global) $dir
+-        Remove-Item $dir -ErrorAction Stop -Recurse -Force
++        $dir = Join-Path $appDir $version
++        $inspectOwners = $false
++        try {
++            $dir = versiondir $app $version $global
++            $dir = Assert-CleanupVersionPath $dir $appDir $current_version
++            $inspectOwners = $true
++            Unlink-CleanupData (installed_manifest $app $version $global) $dir
++            $dir = Assert-CleanupVersionPath $dir $appDir $current_version
++            Remove-Item -LiteralPath $dir -ErrorAction Stop -Recurse -Force
++        } catch {
++            Write-Host ''
++            Write-CleanupFailure $app $version $dir $_ $inspectOwners
++        }
+     }
+-    $leftVersions = Get-ChildItem $appDir
+-    if ($leftVersions.Length -eq 1 -and $leftVersions.Name -eq 'current' -and $leftVersions.LinkType) {
+-        attrib $leftVersions.FullName -R /L
+-        Remove-Item $leftVersions.FullName -ErrorAction Stop -Force
+-        $leftVersions = $null
++    $leftVersions = Get-ChildItem -LiteralPath $appDir -Force -ErrorAction Stop
++    if (!$leftVersions) { Remove-Item -LiteralPath $appDir -ErrorAction Stop -Force }
++    Write-Host ''
++}
++
++function Invoke-CleanupApps($apps, $verbose, $cache) {
++    $script:cleanupFailures = 0
++    foreach ($entry in $apps) {
++        try { cleanup $entry[0] $entry[1] $verbose $cache }
++        catch { Write-CleanupFailure $entry[0] 'app' (appdir $entry[0] $entry[1]) $_ }
+     }
+-    if (!$leftVersions) {
+-        Remove-Item $appDir -ErrorAction Stop -Force
++    if ($cache) {
++        try { Remove-Item "$cachedir\*.download" -ErrorAction Stop }
++        catch { Write-CleanupFailure 'cache' 'downloads' "$cachedir\*.download" $_ }
+     }
+-    Write-Host ''
++    if ($script:cleanupFailures) {
++        warn "Cleanup incomplete: $script:cleanupFailures operation(s) failed. Other apps and versions were still processed."
++        return 1
++    }
++    if (!$verbose) { success 'Everything is shiny now!' }
++    return 0
+ }
+ 
+ if ($apps -or $all) {
+@@ -74,15 +343,7 @@ if ($apps -or $all) {
+     }
+ 
+     # $apps is now a list of ($app, $global) tuples
+-    $apps | ForEach-Object { cleanup @_ $verbose $cache }
+-
+-    if ($cache) {
+-        Remove-Item "$cachedir\*.download" -ErrorAction Ignore
+-    }
+-
+-    if (!$verbose) {
+-        success 'Everything is shiny now!'
+-    }
++    exit (Invoke-CleanupApps $apps $verbose $cache)
+ }
+ 
+ exit 0
+diff --git a/libexec/scoop-config.ps1 b/libexec/scoop-config.ps1
+index a2d1cb37..3122d9c3 100644
+--- a/libexec/scoop-config.ps1
++++ b/libexec/scoop-config.ps1
+@@ -108,6 +108,11 @@
+ #       any target app process is running. Procedure here refers to reset/uninstall/update.
+ #       When set to $true, Scoop only displays a warning message and continues procedure.
+ #
++# kill_running_processes: $true|$false
++#       When set to $true, Scoop force-stops running target app processes before reset/uninstall/update.
++#       Updates download and validate the new version before stopping the old app.
++#       This local extension takes precedence over ignore_running_processes.
++#
+ # private_hosts:
+ #       Array of private hosts that need additional authentication.
+ #       For example, if you want to access a private GitHub repository,
+diff --git a/libexec/scoop-update.ps1 b/libexec/scoop-update.ps1
+index 387ae4e0..64ffcdab 100644
+--- a/libexec/scoop-update.ps1
++++ b/libexec/scoop-update.ps1
+@@ -303,13 +303,6 @@ function update($app, $global, $force = $false, $quiet = $false, $independent, $
+ 
+     Write-Host "Updating '$app' ($old_version -> $version)"
+ 
+-    #region Workaround for #2952
+-    if (test_running_process $app $global) {
+-        Write-Host 'Running process detected, skip updating.'
+-        return
+-    }
+-    #endregion Workaround for #2952
+-
+     # region Workaround
+     # Workaround for https://github.com/ScoopInstaller/Scoop/issues/2220 until install is refactored
+     # Remove and replace whole region after proper fix
+@@ -345,6 +338,12 @@ function update($app, $global, $force = $false, $quiet = $false, $independent, $
+     $check_hash = $false
+     # endregion Workaround
+ 
++    # Keep the app running until downloads and hash validation have succeeded.
++    if (test_running_process $app $global) {
++        Write-Host 'Running process detected, skip updating.'
++        return
++    }
++
+     $dir = versiondir $app $old_version $global
+     $persist_dir = persistdir $app $global
+ 

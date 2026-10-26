@@ -31,7 +31,8 @@ Describe 'Apply-LocalExtensions safety and compatibility' {
         $script:targetRoot = Join-Path $fixtureRoot 'scoop'
         $script:bundleRoot = Join-Path $fixtureRoot 'bundle'
         $script:backups = @()
-        $script:sourcePaths = @('lib/install.ps1', 'libexec/scoop-config.ps1', 'libexec/scoop-update.ps1', 'libexec/scoop-cleanup.ps1')
+        $script:sourcePaths = @('lib/install.ps1', 'libexec/scoop-config.ps1', 'libexec/scoop-update.ps1', 'libexec/scoop-cleanup.ps1', 'bin/scoop.ps1', 'lib/core.ps1')
+        $script:legacyPaths = $sourcePaths[0..3]
         $script:subject = Join-Path $bundleRoot 'scripts/Apply-LocalExtensions.ps1'
         New-Item -ItemType Directory -Path $targetRoot, (Join-Path $bundleRoot 'scripts'), (Join-Path $bundleRoot 'patches') -Force | Out-Null
         if (Test-Path -LiteralPath $applyScriptSource) { Copy-Item -LiteralPath $applyScriptSource -Destination $subject }
@@ -40,6 +41,9 @@ Describe 'Apply-LocalExtensions safety and compatibility' {
             revision = 'e6aa3b366bdee8ed138c1e0f7b85192ebdd35d0f'
             version = '0.6.0'
             patch = 'patches/local-extensions.patch'
+            bundle_version = '0.2.0'
+            legacy_patch = 'patches/local-extensions-v1.patch'
+            upgrade_patch = 'patches/upgrade-v1.patch'
         } | ConvertTo-Json | Set-Content -LiteralPath (Join-Path $bundleRoot 'upstream.json') -Encoding ASCII
         $patch = ''
         foreach ($relativePath in $sourcePaths) {
@@ -50,6 +54,20 @@ Describe 'Apply-LocalExtensions safety and compatibility' {
         }
         $script:patchPath = Join-Path $bundleRoot 'patches/local-extensions.patch'
         [IO.File]::WriteAllText($patchPath, $patch)
+        $legacyPatch = ''
+        $upgradePatch = ''
+        foreach ($relativePath in $sourcePaths) {
+            $previous = 'old'
+            if ($legacyPaths -contains $relativePath) {
+                $previous = if ($relativePath -eq 'lib/install.ps1') { 'new' } else { 'legacy' }
+                $legacyPatch += "diff --git a/$relativePath b/$relativePath`n--- a/$relativePath`n+++ b/$relativePath`n@@ -1 +1 @@`n-old`n+$previous`n"
+            }
+            if ($relativePath -ne 'lib/install.ps1') {
+                $upgradePatch += "diff --git a/$relativePath b/$relativePath`n--- a/$relativePath`n+++ b/$relativePath`n@@ -1 +1 @@`n-$previous`n+new`n"
+            }
+        }
+        [IO.File]::WriteAllText((Join-Path $bundleRoot 'patches/local-extensions-v1.patch'), $legacyPatch)
+        [IO.File]::WriteAllText((Join-Path $bundleRoot 'patches/upgrade-v1.patch'), $upgradePatch)
         & git -C $targetRoot init --quiet
         & git -C $targetRoot config core.autocrlf false
         & git -C $targetRoot add -- $sourcePaths
@@ -72,13 +90,13 @@ Describe 'Apply-LocalExtensions safety and compatibility' {
         foreach ($path in $sourcePaths) { [IO.File]::ReadAllText((Join-Path $targetRoot $path)) | Assert-TestEqual "old`n" }
     }
 
-    It 'backs up only the four originals outside the worktree' {
+    It 'backs up only the allowed originals outside the worktree' {
         [IO.File]::WriteAllText((Join-Path $targetRoot 'private-config.json'), 'do-not-copy')
         $result = & $subject -ScoopRoot $targetRoot
         $script:backups += $result.BackupPath
         $result.Status | Assert-TestEqual 'Applied'
         $result.BackupPath.StartsWith($targetRoot, [StringComparison]::OrdinalIgnoreCase) | Assert-TestEqual $false
-        @(Get-ChildItem -LiteralPath $result.BackupPath -File -Recurse).Count | Assert-TestEqual 4
+        @(Get-ChildItem -LiteralPath $result.BackupPath -File -Recurse).Count | Assert-TestEqual $sourcePaths.Count
         foreach ($path in $sourcePaths) {
             [IO.File]::ReadAllText((Join-Path $targetRoot $path)) | Assert-TestEqual "new`n"
             [IO.File]::ReadAllText((Join-Path $result.BackupPath $path)) | Assert-TestEqual "old`n"
@@ -121,7 +139,7 @@ Describe 'Apply-LocalExtensions safety and compatibility' {
         $script:backups += $result.BackupPath
         $result.Status | Assert-TestEqual 'Applied'
         [IO.File]::ReadAllText((Join-Path $targetRoot 'notes.txt')) | Assert-TestEqual 'keep-local'
-        @(& git -C $targetRoot diff --cached --name-only).Count | Assert-TestEqual 4
+        @(& git -C $targetRoot diff --cached --name-only).Count | Assert-TestEqual $sourcePaths.Count
     }
 
     It 'rejects a patch naming an unexpected source file' {
@@ -183,5 +201,47 @@ Describe 'Apply-LocalExtensions safety and compatibility' {
         { & $subject -ScoopRoot $targetRoot -Check } | Assert-TestThrows
         [IO.File]::ReadAllText((Join-Path $external 'install.ps1')) | Assert-TestEqual "old`n"
         [IO.Directory]::Delete((Join-Path $targetRoot 'lib'))
+    }
+
+    It 'checks and upgrades a complete previous bundle without an intermediate reverse application' {
+        & git -C $targetRoot apply -- (Join-Path $bundleRoot 'patches/local-extensions-v1.patch')
+        if ($LASTEXITCODE -ne 0) { throw 'Could not prepare previous-bundle fixture.' }
+        $before = [IO.File]::ReadAllText((Join-Path $targetRoot 'libexec/scoop-cleanup.ps1'))
+        $check = & $subject -ScoopRoot $targetRoot -Check
+        $check.Status | Assert-TestEqual 'UpgradeApplicable'
+        $check.BackupPath | Assert-TestEmpty
+        [IO.File]::ReadAllText((Join-Path $targetRoot 'libexec/scoop-cleanup.ps1')) | Assert-TestEqual $before
+        $result = & $subject -ScoopRoot $targetRoot
+        $script:backups += $result.BackupPath
+        $result.Status | Assert-TestEqual 'Upgraded'
+        foreach ($path in $sourcePaths) { [IO.File]::ReadAllText((Join-Path $targetRoot $path)) | Assert-TestEqual "new`n" }
+        [IO.File]::ReadAllText((Join-Path $result.BackupPath 'libexec/scoop-cleanup.ps1')) | Assert-TestEqual "legacy`n"
+        (& $subject -ScoopRoot $targetRoot -Check).Status | Assert-TestEqual 'AlreadyApplied'
+    }
+
+    It 'rejects an incomplete previous bundle without changing other source files' {
+        [IO.File]::WriteAllText((Join-Path $targetRoot 'libexec/scoop-cleanup.ps1'), "legacy`n")
+        { & $subject -ScoopRoot $targetRoot } | Assert-TestThrows
+        [IO.File]::ReadAllText((Join-Path $targetRoot 'lib/core.ps1')) | Assert-TestEqual "old`n"
+        [IO.File]::ReadAllText((Join-Path $targetRoot 'libexec/scoop-cleanup.ps1')) | Assert-TestEqual "legacy`n"
+    }
+
+    It 'rejects an upgrade patch that names an unexpected source path' {
+        & git -C $targetRoot apply -- (Join-Path $bundleRoot 'patches/local-extensions-v1.patch')
+        if ($LASTEXITCODE -ne 0) { throw 'Could not prepare previous-bundle fixture.' }
+        $upgrade = Join-Path $bundleRoot 'patches/upgrade-v1.patch'
+        [IO.File]::WriteAllText($upgrade, [IO.File]::ReadAllText($upgrade).Replace('lib/core.ps1', 'private-config.json'))
+        { & $subject -ScoopRoot $targetRoot } | Assert-TestThrows
+        [IO.File]::ReadAllText((Join-Path $targetRoot 'libexec/scoop-cleanup.ps1')) | Assert-TestEqual "legacy`n"
+    }
+
+    It 'keeps a previous-bundle upgrade preview read-only under WhatIf' {
+        & git -C $targetRoot apply -- (Join-Path $bundleRoot 'patches/local-extensions-v1.patch')
+        if ($LASTEXITCODE -ne 0) { throw 'Could not prepare previous-bundle fixture.' }
+        $result = & $subject -ScoopRoot $targetRoot -WhatIf
+        $result.Status | Assert-TestEqual 'WhatIf'
+        $result.BackupPath | Assert-TestEmpty
+        [IO.File]::ReadAllText((Join-Path $targetRoot 'lib/core.ps1')) | Assert-TestEqual "old`n"
+        [IO.File]::ReadAllText((Join-Path $targetRoot 'libexec/scoop-cleanup.ps1')) | Assert-TestEqual "legacy`n"
     }
 }

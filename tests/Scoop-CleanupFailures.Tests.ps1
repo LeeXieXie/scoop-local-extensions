@@ -30,6 +30,8 @@ Describe 'Cleanup failures are isolated and reported safely' -Tag 'Scoop' {
                     $script:moduleReads = 0
                     $cachedir = Join-Path $Root 'cache'
                     New-Item -ItemType Directory -Path $cachedir -Force | Out-Null
+                    if ($Scenario -eq 'cache') { [IO.File]::WriteAllText((Join-Path $cachedir 'first#1.0#payload.zip'), 'fixture') }
+                    if ($Scenario -eq 'downloads') { [IO.File]::WriteAllText((Join-Path $cachedir 'partial.download'), 'fixture') }
                     foreach ($app in @('first', 'second')) {
                         foreach ($version in @('1.0', '2.0', '3.0')) {
                             $directory = Join-Path $Root "$app\$version"
