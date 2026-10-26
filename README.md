@@ -11,6 +11,9 @@
 4. **修改操作互斥**：有副作用的 Scoop 命令串行进入，超时报告持锁进程而不是强杀；帮助、查询及 `cleanup --dry-run` 不等待写锁。
 5. **清理保留与预演**：`--keep N` 保留当前版本及最近安装的 N-1 个旧版本；`--dry-run` 只展示删除/保留计划，不修改联接、属性、缓存或应用文件。
 6. **Git 网络超时与失败汇总**：给 clone/fetch/pull/ls-remote 设置可配置的时间上限；单个 bucket 失败不妨碍其他 bucket 检查，但不会把不完整同步报告成成功。
+7. **批量准备与预下载**：`update --prefetch` 只准备本批更新；`update --batch` 在所有目标及缺失依赖下载校验通过后，再串行执行更新。
+8. **缓存离线安装/更新**：`install --offline` / `update --offline` 使用本地清单及已校验缓存；缺少文件、无哈希或存在不允许的安装脚本时，在改变应用前拒绝执行。
+9. **显式更新后恢复**：`update --restart` 仅在成功后尝试重新启动本次确实停止且符合策略的普通 GUI 主程序，不恢复系统进程、服务、参数或工作会话。
 
 清理失败时会尽力查询 Windows Restart Manager，显示可识别占用者的 PID、进程名、程序路径及诊断来源；只显示手动操作提示，不自动执行停止命令。诊断不能保证准确识别所有占用者；权限不足、资源管理器加载 DLL、杀毒软件或其他原因都可能使删除失败。补丁不会为了清理而强杀进程、重启 Explorer、修改 ACL、取得所有权或安排重启删除。
 
@@ -21,7 +24,7 @@
 - 精确来源和补丁文件见 [`upstream.json`](upstream.json)。
 - 其他 Scoop 修订只有在完整补丁预检通过时才能应用；不保证未来上游版本自动兼容。
 
-当前补丁包版本为 **0.2.0**：完整补丁修改六个已有源码文件。已完整应用时再次运行不会重复修改；完整的旧版补丁通过独立增量补丁升级，先做完整预检，不先撤销正在使用的旧功能。只有部分功能存在、存在冲突或上游上下文变化时，脚本拒绝写入，而不是强行覆盖本地修改。
+当前补丁包版本为 **0.3.0**：完整补丁修改八个已有源码文件。已完整应用时再次运行不会重复修改；完整的 v1 或 0.2.0 补丁通过独立增量补丁升级，先做完整预检，不先撤销正在使用的旧功能。只有部分功能存在、存在冲突或上游上下文变化时，脚本拒绝写入，而不是强行覆盖本地修改。
 
 ## 应用
 
@@ -43,14 +46,14 @@ $scoopRoot = scoop prefix scoop
 
 ### 保存目标 Scoop 仓库中的修改
 
-应用脚本只修改六个明确允许的源码文件，**不会自动创建 Git 提交**。补丁仓库已经推送到 GitHub，不等于目标 Scoop 仓库中的修改也已提交；默认 Scoop 遇到未提交的源码变更会提示 `Uncommitted changes detected. Update aborted.` 并拒绝自更新。
+应用脚本只修改八个明确允许的源码文件，**不会自动创建 Git 提交**。补丁仓库已经推送到 GitHub，不等于目标 Scoop 仓库中的修改也已提交；默认 Scoop 遇到未提交的源码变更会提示 `Uncommitted changes detected. Update aborted.` 并拒绝自更新。
 
 先检查差异，确认要保留的本地修改，再在目标 Scoop 仓库提交。不要在未审核的情况下提交其他文件：
 
 ```powershell
 git -C $scoopRoot status --short
-git -C $scoopRoot diff -- lib/install.ps1 libexec/scoop-config.ps1 libexec/scoop-update.ps1 libexec/scoop-cleanup.ps1 bin/scoop.ps1 lib/core.ps1
-git -C $scoopRoot add -- lib/install.ps1 libexec/scoop-config.ps1 libexec/scoop-update.ps1 libexec/scoop-cleanup.ps1 bin/scoop.ps1 lib/core.ps1
+git -C $scoopRoot diff -- lib/install.ps1 libexec/scoop-config.ps1 libexec/scoop-update.ps1 libexec/scoop-cleanup.ps1 bin/scoop.ps1 lib/core.ps1 lib/download.ps1 libexec/scoop-install.ps1
+git -C $scoopRoot add -- lib/install.ps1 libexec/scoop-config.ps1 libexec/scoop-update.ps1 libexec/scoop-cleanup.ps1 bin/scoop.ps1 lib/core.ps1 lib/download.ps1 libexec/scoop-install.ps1
 git -C $scoopRoot commit -m "Keep reviewed local extensions during Scoop updates" -m "Scope-risk: moderate"
 ```
 
@@ -112,6 +115,31 @@ scoop config git_network_timeout 120
 
 网络超时只针对本次启动的 Git 子进程树，不结束其他 Git 工作、不重置源码、不更换远程地址。某个 bucket 同步失败会汇总显示，不更新“上次成功同步”时间，也不打印整体成功。该限制不是应用下载超时，不影响已有下载器的独立设置。
 
+## 批量准备、离线模式与恢复
+
+以下选项均显式启用，不改变普通 `scoop update` 的默认流程：
+
+```powershell
+# 只为整批待更新应用及缺失依赖准备缓存，不停止或更新应用。
+scoop update '*' --prefetch
+
+# 整批文件全部下载校验成功后，才开始逐个更新。
+scoop update '*' --batch
+
+# 使用当前本地 bucket 清单和缓存，不同步 Scoop/bucket，不下载缺失文件。
+scoop update '*' --offline
+scoop install personal/example-portable --offline
+
+# 显式要求在成功更新后恢复本次实际停止的合格 GUI 主程序。
+scoop update magpie-ai --batch --restart
+```
+
+`example-portable` 只是语法示例，需替换为真实、符合离线策略且已缓存的包。预下载不是导出包，也不会把所有历史版本下载到缓存。准备阶段固定本次的清单、版本、来源与架构；缺失依赖也必须先就绪，不能在关闭应用后才临时联网。安装仍串行，某个安装失败时不承诺整批原子性或自动回滚。
+
+**离线模式不等于网络沙箱。** 它禁止 Scoop 自身的远程清单解析、同步及有效载荷下载，仅使用已有本地清单及带有效哈希的完整缓存。为避免任意脚本或安装器绕过下载路径，离线模式保守拒绝安装/卸载钩子、外部安装器、`env_set` 动态展开、MSI、nightly 或无哈希包，也不接受跳过哈希、绕过缓存等冲突选项。远程/UNC/网络盘来源、`@version` 生成以及含未完成下载标记或联接/硬链接的缓存同样不支持。大多数带自定义钩子的 GUI 包可能因此不能离线安装；不静默放宽此限制。外部解压工具及安装后由用户运行的程序不受本扩展的操作系统级网络隔离。
+
+**恢复不是会话还原。** 仅记录并去重本次由更新停止、且可核对为清单 GUI 快捷方式目标的主程序相对路径，不保存完整命令行、环境、凭据或工作目录。只在确认新版本安装成功、目标路径位于新安装目录内且不是重解析点逃逸后启动，不带原始参数；不会恢复未保存的内容。服务、Explorer、终端、当前工作进程及其祖先链、关键系统进程和后台子助手不作为自动恢复对象。没有可确认的主程序快捷方式时保守跳过。未开启 `--restart`、程序原本没运行、更新被跳过或失败时不会自动启动新版；此选项本身不自动启用 `kill_running_processes`。
+
 ## 测试
 
 对已应用补丁的 Scoop 源码运行聚焦测试：
@@ -133,7 +161,7 @@ scoop config git_network_timeout 120
 - 每次修改补丁时同步更新本 README、设计说明、基准信息和回归测试。
 - 发布仓库不等于自动把这些功能合入上游，也不会使所有人的 Scoop 自动获得补丁。
 
-设计和安全约束见 [`DESIGN.md`](DESIGN.md)，初版执行记录见 [`docs/PLAN.md`](docs/PLAN.md)，本轮范围见 [`docs/MILESTONE-2.md`](docs/MILESTONE-2.md)，网上方案的借鉴与取舍见 [`docs/REFERENCES.md`](docs/REFERENCES.md)。批量预下载、离线安装及自动恢复仍未实现，不属于 0.2.0 的功能。
+设计和安全约束见 [`DESIGN.md`](DESIGN.md)，初版执行记录见 [`docs/PLAN.md`](docs/PLAN.md)，互斥/保留策略见 [`docs/MILESTONE-2.md`](docs/MILESTONE-2.md)，本轮范围见 [`docs/MILESTONE-3.md`](docs/MILESTONE-3.md)，网上方案的借鉴与取舍见 [`docs/REFERENCES.md`](docs/REFERENCES.md)。
 
 ## 许可
 

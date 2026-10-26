@@ -3,7 +3,9 @@
   "revision": "e6aa3b366bdee8ed138c1e0f7b85192ebdd35d0f",
   "version": "0.6.0",
   "patch": "patches/local-extensions.patch",
-  "bundle_version": "0.2.0",
+  "bundle_version": "0.3.0",
   "legacy_patch": "patches/local-extensions-v1.patch",
-  "upgrade_patch": "patches/upgrade-v1.patch"
+  "upgrade_patch": "patches/upgrade-v1.patch",
+  "legacy_v2_patch": "patches/local-extensions-v2.patch",
+  "upgrade_v2_patch": "patches/upgrade-v2.patch"
 }

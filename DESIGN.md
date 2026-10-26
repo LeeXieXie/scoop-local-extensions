@@ -13,14 +13,16 @@ license is retained. Only these production paths belong in the patch:
 - `libexec/scoop-cleanup.ps1`: safe partial-cleanup handling and diagnostics.
 - `bin/scoop.ps1`: bounded mutation-operation locking and command classification.
 - `lib/core.ps1`: bounded network Git subprocesses with isolated proxy settings.
+- `lib/download.ps1`: local-only manifest planning and verified cache acquisition.
+- `libexec/scoop-install.ps1`: explicit offline preflight before installation.
 
 ## Apply Contract
 
 The caller selects a Scoop source tree explicitly. A forward compatibility check
 must succeed for the entire patch before source modification. A successful
 reverse check recognizes an already-complete installation. A recognized complete
-v1 can upgrade with an incremental patch; no live reverse-application step is
-performed. Both paths back up the six allowlisted source files. Partial application
+v1 or 0.2.0 can upgrade with an incremental patch; no live reverse-application
+step is performed. These paths back up the eight allowlisted source files. Partial application
 or conflicting changes are rejected; no force/overwrite mode is provided.
 Source backups precede application. A check-only invocation does not modify the
 target. Installation configuration, remotes, update channels, and applications
@@ -28,7 +30,7 @@ are never changed by this script.
 
 Application deliberately leaves source changes uncommitted for human review.
 Scoop's own updater rejects tracked uncommitted changes by default, so the user
-must review and commit the six source paths in the target Scoop repository.
+must review and commit the eight source paths in the target Scoop repository.
 Publishing this bundle is not a substitute for that local commit. The bundle
 repository is not a valid replacement for the complete Scoop update source.
 
@@ -76,6 +78,33 @@ Deadlines apply to network operations only; zero disables them. Cancellation
 targets the child process tree created for that operation. Failed bucket syncs
 are aggregated without marking a partial operation as fully successful. There is
 no automatic reset, stash, remote replacement, service recovery, or app rollback.
+
+## Prepared Acquisition and Explicit Relaunch
+
+Batch preparation freezes manifest/version/source/architecture and covers missing
+dependencies before any process stop or installation side effect. Prefetch-only
+exits at the preparation barrier. Payload identity is rechecked before use;
+serial installation does not imply a transaction or complete recovery.
+
+Offline acquisition uses local manifests and existing complete cache files only.
+Missing hashes, nightly versions, remote metadata inputs and incompatible cache
+or hash bypass options fail closed. Arbitrary hooks and external installer or
+uninstaller execution are rejected before stopping an old application or making
+installation directories. Prepared installation serializes the frozen manifest
+instead of re-fetching the source through the legacy manifest-save function.
+This policy is not an OS network sandbox for extraction tools or installed apps.
+Metadata-only local selection precedes cache/policy checks for held or unchanged
+applications. Duplicate dependency keys must agree on their frozen identities;
+individually valid plans from different buckets cannot silently overwrite one another.
+
+Relaunch is explicit and limited to ordinary GUI executables actually stopped by
+the current update, deduplicated by safe relative identity. Do not capture command
+lines, credentials, environment or CWD. Verify successful new installation and
+physical path containment before starting without arguments. Services, shells,
+system/critical processes, the current execution chain and background helpers are
+excluded. Primary identity is restricted to verified manifest GUI shortcut targets,
+not every child process that happens to have a window. Do not promise restored application sessions or recover failed updates
+by launching an unverified new executable.
 
 ## Verification
 

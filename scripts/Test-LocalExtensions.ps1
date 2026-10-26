@@ -9,7 +9,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $bundleRoot = Split-Path -Parent $PSScriptRoot
 $sourceRoot = (Resolve-Path -LiteralPath $ScoopRoot).ProviderPath
-$sourcePaths = @('lib/install.ps1', 'libexec/scoop-config.ps1', 'libexec/scoop-update.ps1', 'libexec/scoop-cleanup.ps1', 'bin/scoop.ps1', 'lib/core.ps1')
+$sourcePaths = @('lib/install.ps1', 'libexec/scoop-config.ps1', 'libexec/scoop-update.ps1', 'libexec/scoop-cleanup.ps1', 'bin/scoop.ps1', 'lib/core.ps1', 'lib/download.ps1', 'libexec/scoop-install.ps1')
 $parsePaths = @()
 foreach ($relativePath in $sourcePaths) {
     $sourcePath = Join-Path $sourceRoot $relativePath

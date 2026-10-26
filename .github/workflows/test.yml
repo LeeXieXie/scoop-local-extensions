@@ -65,7 +65,7 @@ jobs:
         run: |
           $source = Join-Path $env:RUNNER_TEMP 'scoop-local-extensions-upstream'
           ./scripts/Test-LocalExtensions.ps1 -ScoopRoot $source
-      - name: Verify upgrade from the previous complete bundle
+      - name: Verify direct upgrade from the complete v1 bundle
         run: |
           $ErrorActionPreference = 'Stop'
           $source = Join-Path $env:RUNNER_TEMP 'scoop-local-extensions-upstream'
@@ -77,6 +77,27 @@ jobs:
           git -C $upgradeSource checkout --quiet --detach HEAD
           if ($LASTEXITCODE -ne 0) { throw 'Upgrade fixture source preparation failed.' }
           $legacyPatch = (Resolve-Path -LiteralPath './patches/local-extensions-v1.patch').ProviderPath
+          git -C $upgradeSource apply -- $legacyPatch
+          if ($LASTEXITCODE -ne 0) { throw 'Previous-bundle fixture preparation failed.' }
+          $preview = ./scripts/Apply-LocalExtensions.ps1 -ScoopRoot $upgradeSource -Check
+          if ($preview.Status -ne 'UpgradeApplicable' -or $preview.BackupPath) { throw 'Upgrade preflight failed.' }
+          $upgraded = ./scripts/Apply-LocalExtensions.ps1 -ScoopRoot $upgradeSource
+          if ($upgraded.Status -ne 'Upgraded' -or -not $upgraded.BackupPath) { throw 'Upgrade application failed.' }
+          $again = ./scripts/Apply-LocalExtensions.ps1 -ScoopRoot $upgradeSource
+          if ($again.Status -ne 'AlreadyApplied' -or $again.BackupPath) { throw 'Upgrade idempotence failed.' }
+          ./scripts/Test-LocalExtensions.ps1 -ScoopRoot $upgradeSource
+      - name: Verify direct upgrade from the complete v2 bundle
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $source = Join-Path $env:RUNNER_TEMP 'scoop-local-extensions-upstream'
+          $upgradeSource = Join-Path $env:RUNNER_TEMP 'scoop-local-extensions-v2-upgrade'
+          if (Test-Path -LiteralPath $upgradeSource) { throw 'Upgrade fixture already exists.' }
+          git clone --quiet --no-hardlinks --no-checkout $source $upgradeSource
+          if ($LASTEXITCODE -ne 0) { throw 'Upgrade fixture clone failed.' }
+          git -C $upgradeSource config core.autocrlf false
+          git -C $upgradeSource checkout --quiet --detach HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Upgrade fixture source preparation failed.' }
+          $legacyPatch = (Resolve-Path -LiteralPath './patches/local-extensions-v2.patch').ProviderPath
           git -C $upgradeSource apply -- $legacyPatch
           if ($LASTEXITCODE -ne 0) { throw 'Previous-bundle fixture preparation failed.' }
           $preview = ./scripts/Apply-LocalExtensions.ps1 -ScoopRoot $upgradeSource -Check

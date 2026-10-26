@@ -519,6 +519,380 @@ index 7ca74ceb..d7b26140 100644
          return $true
      }
  }
+diff --git a/lib/download.ps1 b/lib/download.ps1
+index 326d9d81..59e37a0b 100644
+--- a/lib/download.ps1
++++ b/lib/download.ps1
+@@ -1,8 +1,164 @@
+ # Description: Functions for downloading files
+ 
++function Assert-ScoopOfflinePhysicalPath($Path, $Root) {
++    $full = [IO.Path]::GetFullPath($Path)
++    if ($full.StartsWith('\\') -or $full -match '^\\\\\?\\|^[^:]+::') { throw 'Offline paths must be local physical paths.' }
++    if ($Root) {
++        $base = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + [IO.Path]::DirectorySeparatorChar
++        if (!$full.StartsWith($base, [StringComparison]::OrdinalIgnoreCase)) { throw 'Offline path escapes its root.' }
++    }
++    if ($full.Substring([IO.Path]::GetPathRoot($full).Length).Contains(':')) { throw 'Offline paths cannot use alternate data streams.' }
++    if ((New-Object IO.DriveInfo ([IO.Path]::GetPathRoot($full))).DriveType -eq [IO.DriveType]::Network) { throw 'Offline paths cannot use network drives.' }
++    $item = Get-Item -LiteralPath $full -Force -ErrorAction Stop
++    $cursor = $item
++    while ($cursor) {
++        if ($cursor.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Offline paths cannot traverse reparse points.' }
++        if ($cursor.PSObject.Properties['LinkType'] -and $cursor.LinkType) { throw 'Offline paths cannot be links.' }
++        $cursor = if ($cursor -is [IO.DirectoryInfo]) { $cursor.Parent } else { $cursor.Directory }
++    }
++    return $item
++}
++
++function Assert-ScoopOfflineInput($Spec) {
++    if (!$Spec -or $Spec -match '[@&]|(^|[\\/])\.\.([\\/]|$)|^\\\\|^[a-z]+://' -or $Spec -match '[\[\]*?]') {
++        throw "Unsupported offline manifest input '$Spec'."
++    }
++    if ($Spec -match '^(?:[a-zA-Z0-9_-][a-zA-Z0-9_.-]*/)?[a-zA-Z0-9_-][a-zA-Z0-9_.-]*$' -and !$Spec.EndsWith('.json')) { return }
++    if (!$Spec.EndsWith('.json', [StringComparison]::OrdinalIgnoreCase)) { throw 'Offline inputs must be bucket names or local JSON files.' }
++    $item = Assert-ScoopOfflinePhysicalPath $Spec
++    if ($item.PSIsContainer) { throw 'Offline manifest must be a file.' }
++}
++
++function Assert-ScoopOfflineManifest($Manifest, $Architecture, $AllowScripts = $false) {
++    if (!$Manifest -or !$Manifest.version -or $Manifest.version -match 'nightly|[^\w.\-+]|\.$|^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)' ) { throw 'Offline manifests require a fixed safe version.' }
++    $sections = @($Manifest)
++    if ($Manifest.architecture) { $sections += @($Manifest.architecture.PSObject.Properties | ForEach-Object { $_.Value }) }
++    foreach ($section in $sections) {
++        foreach ($field in @('pre_install', 'post_install', 'pre_uninstall', 'post_uninstall', 'installer', 'uninstaller', 'msi', 'env_set')) {
++            if (!$AllowScripts -and $null -ne $section.$field) { throw "Offline manifests cannot contain '$field'." }
++        }
++    }
++    $urls = @(script:url $Manifest $Architecture)
++    if (!$urls.Count) { throw 'Offline manifests require payload URLs.' }
++    $names = @{}
++    foreach ($url in $urls) {
++        $name = url_filename $url
++        if (!$AllowScripts -and $name -match '(?i)\.msi$') { throw 'Offline MSI extraction is not supported.' }
++        if ($name -and ($name -ne $name.Trim() -or $name.EndsWith('.') -or $name.IndexOfAny([IO.Path]::GetInvalidFileNameChars()) -ge 0 -or $name -match '^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9]|CONIN\$|CONOUT\$)(\.|$)')) { throw 'Unsafe Windows payload filename.' }
++        if (!$name -or [IO.Path]::GetFileName($name) -ne $name -or $name -match '[:\\/]|^\.{1,2}$|(?i)\.(aria2|download|tmp|part)$' -or $names.ContainsKey($name)) { throw 'Unsafe or duplicate offline payload filename.' }
++        $names[$name] = $true
++        $hash = hash_for_url $Manifest $url $Architecture
++        if ($hash -notmatch '^(?:(md5):[a-fA-F0-9]{32}|(sha1):[a-fA-F0-9]{40}|(?:sha256:)?[a-fA-F0-9]{64}|sha512:[a-fA-F0-9]{128})$') { throw 'Offline payloads require explicit supported hashes.' }
++    }
++}
++
++function Assert-ScoopCachedPayload($App, $Version, $Manifest, $Architecture) {
++    if ($Version -ne $Manifest.version) { throw 'Cached payload version differs from its manifest.' }
++    if ($App -notmatch '^[a-zA-Z0-9_-][a-zA-Z0-9_.-]*$' -or $Version -match '[^\w.\-+]') { throw 'Invalid cached payload identity.' }
++    if (Test-Path -LiteralPath (Join-Path $cachedir ($App + '.txt'))) { throw 'Incomplete aria2 application download.' }
++    Assert-ScoopOfflineManifest $Manifest $Architecture $true
++    foreach ($url in @(script:url $Manifest $Architecture)) {
++        $cached = cache_path $App $Version $url
++        $item = Assert-ScoopOfflinePhysicalPath $cached $cachedir
++        if ($item.PSIsContainer -or $item.Name -match '(?i)\.aria2$|\.download$|\.tmp$|\.part$' -or (Test-Path -LiteralPath ($cached + '.aria2')) -or (Test-Path -LiteralPath ($cached + '.download')) -or (Test-Path -LiteralPath ($cached + '.tmp')) -or (Test-Path -LiteralPath ($cached + '.part'))) { throw "Incomplete offline cache for '$App'." }
++        $hash = hash_for_url $Manifest $url $Architecture
++        if ($hash -notmatch '^(?:md5:[a-fA-F0-9]{32}|sha1:[a-fA-F0-9]{40}|(?:sha256:)?[a-fA-F0-9]{64}|sha512:[a-fA-F0-9]{128})$') { throw 'Cached payloads require explicit supported hashes.' }
++        $algorithm, $expected = get_hash $hash
++        $actual = (Get-FileHash -LiteralPath $item.FullName -Algorithm $algorithm -ErrorAction Stop).Hash
++        if ($actual -ne $expected) { throw "Offline cache hash mismatch for '$App'." }
++        [pscustomobject]@{ Url = $url; Path = $item.FullName; Name = (url_filename $url); Hash = $hash }
++    }
++}
++
++function Get-ScoopOfflineManifestEntry($Spec, $Architecture) {
++    Assert-ScoopOfflineInput $Spec
++    $bucket = $null; $source = $null
++    if ($Spec.EndsWith('.json', [StringComparison]::OrdinalIgnoreCase)) {
++        $source = (Assert-ScoopOfflinePhysicalPath $Spec).FullName
++        $app = [IO.Path]::GetFileNameWithoutExtension($source)
++    } else {
++        $app, $bucket, $unused = parse_app $Spec
++        $candidates = if ($bucket) { @($bucket) } else { @(Get-LocalBucket) }
++        foreach ($candidate in $candidates) {
++            $base = Find-BucketDirectory $candidate
++            $candidatePath = Join-Path $base ($app + '.json')
++            if (Test-Path -LiteralPath $candidatePath -PathType Leaf) {
++                $source = (Assert-ScoopOfflinePhysicalPath $candidatePath $base).FullName
++                $bucket = $candidate
++                break
++            }
++        }
++    }
++    if (!$source) { throw "Offline local manifest missing for '$Spec'." }
++    if ($app -notmatch '^[a-zA-Z0-9_-][a-zA-Z0-9_.-]*$') { throw 'Unsafe offline app name.' }
++    $manifest = Get-Content -LiteralPath $source -Raw -Encoding UTF8 -ErrorAction Stop | ConvertFrom-Json -ErrorAction Stop
++    $manifest = $manifest | ConvertTo-Json -Depth 100 -Compress | ConvertFrom-Json
++    $arch = Get-SupportedArchitecture $manifest $Architecture
++    if (!$arch) { throw "Unsupported offline architecture for '$app'." }
++    $entry = [pscustomobject]@{ App = $app; Spec = $Spec; Manifest = $manifest; Bucket = $bucket; Source = $source; Architecture = $arch; Version = $manifest.version; Offline = $true }
++    $identityText = @($entry.App, $entry.Spec, $entry.Bucket, $entry.Source, $entry.Architecture, $entry.Version, ($entry.Manifest | ConvertTo-Json -Depth 100 -Compress)) -join "`n"
++    $entry | Add-Member -NotePropertyName Identity -NotePropertyValue $identityText
++    return $entry
++}
++
++function Get-ScoopOfflineInstallPlan($Apps, $Architecture, $Global = $false, $Independent = $false) {
++    $entries = New-Object 'System.Collections.Generic.List[object]'
++    $seen = @{}; $visiting = @{}
++    function Resolve-ScoopOfflineEntry($Spec, $Dependency = $false) {
++        $entry = Get-ScoopOfflineManifestEntry $Spec $Architecture
++        $app = $entry.App
++        $source = $entry.Source
++        $manifest = $entry.Manifest
++        $arch = $entry.Architecture
++        Assert-ScoopOfflineManifest $manifest $arch
++        $identity = $source + '|' + $manifest.version
++        if ($seen.ContainsKey($app)) {
++            if ($seen[$app] -ne $identity) { throw "Conflicting offline sources for '$app'." }
++            return
++        }
++        if ($visiting.ContainsKey($app)) { throw "Circular offline dependency '$app'." }
++        $visiting[$app] = $true
++        if ($Independent) {
++            foreach ($helper in @(Get-InstallationHelper $manifest $arch -All)) {
++                if (!(Test-HelperInstalled $helper)) { throw "Offline extraction helper '$helper' is not installed." }
++            }
++        }
++        if (!$Independent) {
++            foreach ($helper in @(Get-InstallationHelper $manifest $arch -All)) {
++                if (!(Test-HelperInstalled $helper)) { Resolve-ScoopOfflineEntry $helper $true }
++            }
++            foreach ($dep in @($manifest.depends)) {
++                if (!$dep) { continue }
++                Assert-ScoopOfflineInput $dep
++                $depApp, $null, $null = parse_app $dep
++                if (!(installed $depApp)) { Resolve-ScoopOfflineEntry $dep $true }
++            }
++        }
++        $payloads = @(Assert-ScoopCachedPayload $app $manifest.version $manifest $arch)
++        $seen[$app] = $identity
++        $visiting.Remove($app)
++        $entry | Add-Member -NotePropertyName Payloads -NotePropertyValue $payloads
++        $entries.Add($entry)
++    }
++    foreach ($spec in $Apps) { Resolve-ScoopOfflineEntry $spec }
++    return $entries.ToArray()
++}
++
+ ## Meta downloader
+ 
+ function Invoke-ScoopDownload ($app, $version, $manifest, $bucket, $architecture, $dir, $use_cache = $true, $check_hash = $true) {
++    if ($script:ScoopOfflineMode) {
++        if (!$use_cache -or !$check_hash) { throw 'Offline downloads require cache and hash verification.' }
++        Assert-ScoopOfflineManifest $manifest $architecture
++        $payloads = @(Assert-ScoopCachedPayload $app $version $manifest $architecture)
++        foreach ($payload in $payloads) {
++            $destination = Join-Path $dir $payload.Name
++            Copy-Item -LiteralPath $payload.Path -Destination $destination -ErrorAction Stop
++            $algorithm, $expected = get_hash $payload.Hash
++            if ((Get-FileHash -LiteralPath $destination -Algorithm $algorithm -ErrorAction Stop).Hash -ne $expected) { throw 'Offline copied payload hash mismatch.' }
++        }
++        return @($payloads | ForEach-Object { $_.Name })
++    }
+     # we only want to show this warning once
+     if (!$use_cache) { warn 'Cache is being ignored.' }
+ 
+@@ -52,6 +208,7 @@ function Invoke-ScoopDownload ($app, $version, $manifest, $bucket, $architecture
+ ## [System.Net] downloader
+ 
+ function Invoke-CachedDownload ($app, $version, $url, $to, $cookies = $null, $use_cache = $true) {
++    if ($script:ScoopOfflineMode) { throw 'Offline downloads must use the verified manifest payload path.' }
+     $cached = cache_path $app $version $url
+ 
+     if (!(Test-Path $cached) -or !$use_cache) {
+@@ -70,6 +227,7 @@ function Invoke-CachedDownload ($app, $version, $url, $to, $cookies = $null, $us
+ }
+ 
+ function Start-Download ($url, $to, $cookies) {
++    if ($script:ScoopOfflineMode) { throw 'Network downloads are disabled in offline mode.' }
+     $progress = [console]::isoutputredirected -eq $false -and
+     $host.name -ne 'Windows PowerShell ISE Host'
+ 
+@@ -87,6 +245,7 @@ function Start-Download ($url, $to, $cookies) {
+ }
+ 
+ function Invoke-Download ($url, $to, $cookies, $progress) {
++    if ($script:ScoopOfflineMode) { throw 'Network downloads are disabled in offline mode.' }
+     # download with filesize and progress indicator
+     $reqUrl = ($url -split '#')[0]
+     $wreq = [Net.WebRequest]::Create($reqUrl)
+@@ -331,6 +490,7 @@ function get_filename_from_metalink($file) {
+ }
+ 
+ function Invoke-CachedAria2Download ($app, $version, $manifest, $architecture, $dir, $cookies = $null, $use_cache = $true, $check_hash = $true) {
++    if ($script:ScoopOfflineMode) { throw 'Aria2 is disabled in offline mode.' }
+     $data = @{}
+     $urls = @(script:url $manifest $architecture)
+ 
+diff --git a/lib/install.ps1 b/lib/install.ps1
+index 573821c7..91a2e05f 100644
+--- a/lib/install.ps1
++++ b/lib/install.ps1
+@@ -1,3 +1,93 @@
++function Assert-ScoopPreparedPayload($Entry) {
++    Assert-ScoopPreparedEntry $Entry
++    if ($Entry.Offline) { Assert-ScoopOfflineManifest $Entry.Manifest $Entry.Architecture }
++    return Assert-ScoopCachedPayload $Entry.App $Entry.Version $Entry.Manifest $Entry.Architecture
++}
++function Assert-ScoopPreparedEntry($Prepared) {
++    if (!$Prepared.App -or !$Prepared.Manifest -or !$Prepared.Version -or !$Prepared.Architecture) { throw 'Incomplete prepared installation.' }
++    if ($Prepared.Version -ne $Prepared.Manifest.version -or $Prepared.Version -eq 'nightly') { throw 'Prepared version identity changed.' }
++    if ($Prepared.Identity) {
++        $identity = @($Prepared.App, $Prepared.Spec, $Prepared.Bucket, $Prepared.Source, $Prepared.Architecture, $Prepared.Version, ($Prepared.Manifest | ConvertTo-Json -Depth 100 -Compress)) -join "`n"
++        if ($identity -cne $Prepared.Identity) { throw 'Prepared manifest or source identity changed.' }
++    }
++}
++
++function Get-ScoopRestartPrimaryExecutable($Manifest, $Architecture) {
++    foreach ($shortcut in @(arch_specific 'shortcuts' $Manifest $Architecture)) {
++        if (!$shortcut -or $shortcut -is [string] -or $shortcut.Count -lt 2) { continue }
++        $relative = [string]$shortcut[0]
++        $relative = $relative -replace '^\$(?:dir|original_dir)[\\/]', ''
++        if (!$relative -or [IO.Path]::IsPathRooted($relative) -or $relative -match '[$%:\x00-\x1f]|(^|[\\/])\.\.([\\/]|$)' -or [IO.Path]::GetExtension($relative) -ne '.exe') { continue }
++        $relative.Replace('/', '\')
++    }
++}
++function Get-ScoopRestartCandidate($Process, $Root) {
++    if (!$script:ScoopRestartPrimaryExecutables) { return }
++    if (!$Process.Path -or !$Process.MainWindowHandle -or $Process.Id -le 4 -or $Process.Id -eq $PID) { return }
++    if ($Process.PSObject.Properties['SessionId'] -and $Process.SessionId -eq 0) { return }
++    if ($Process.PSObject.Properties['IsCritical'] -and $Process.IsCritical) { return }
++    $excluded = '^(pwsh|powershell|cmd|conhost|openconsole|windowsterminal|wt|explorer|services|svchost|lsass|winlogon|csrss|smss|wininit|dwm|sihost|scoop|bash|wsl|mintty|ssh|sshd|terminal|alacritty|wezterm|wezterm-gui|kitty|hyper|tabby|warp|rio|contour|cmder|conemu|conemu64|conemuc|conemuc64|console2|consolez|git-bash|git-cmd|putty|mobaxterm|securecrt|nu|fish|zsh|sh)(\.exe)?$'
++    if ($Process.ProcessName -match $excluded -or [IO.Path]::GetFileNameWithoutExtension($Process.Path) -match $excluded) { return }
++    $prefix = [IO.Path]::GetFullPath($Root).TrimEnd('\', '/') + '\'
++    $path = [IO.Path]::GetFullPath($Process.Path)
++    if (!$path.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase) -or [IO.Path]::GetExtension($path) -ne '.exe') { return }
++    if ($env:WINDIR -and $path.StartsWith(([IO.Path]::GetFullPath($env:WINDIR).TrimEnd('\') + '\'), [StringComparison]::OrdinalIgnoreCase)) { return }
++    try {
++        $ancestors = @($PID)
++        $parent = $PID
++        while ($parent -gt 0) {
++            $record = Get-CimInstance Win32_Process -Filter "ProcessId=$parent" -ErrorAction Stop
++            $parent = [int]$record.ParentProcessId
++            if ($ancestors -contains $parent) { break }
++            $ancestors += $parent
++        }
++        if ($ancestors -contains $Process.Id) { return }
++        if (@(Get-CimInstance Win32_Service -Filter "ProcessId=$($Process.Id)" -ErrorAction Stop).Count) { return }
++        $current = Join-Path $Root 'current'
++        $currentPrefix = [IO.Path]::GetFullPath($current).TrimEnd('\') + '\'
++        if ($path.StartsWith($currentPrefix, [StringComparison]::OrdinalIgnoreCase)) {
++            $relative = $path.Substring($currentPrefix.Length)
++            if ($script:ScoopRestartPrimaryExecutables -contains $relative) { return $relative }
++            return
++        }
++        $currentItem = Get-Item -LiteralPath $current -ErrorAction Stop
++        $physicalRoot = @($currentItem.Target)[0]
++        if (!$physicalRoot) { return }
++        if (![IO.Path]::IsPathRooted($physicalRoot)) { $physicalRoot = Join-Path $Root $physicalRoot }
++        $physicalPrefix = [IO.Path]::GetFullPath($physicalRoot).TrimEnd('\') + '\'
++        if (!$physicalPrefix.StartsWith($prefix, [StringComparison]::OrdinalIgnoreCase)) { return }
++        if ($path.StartsWith($physicalPrefix, [StringComparison]::OrdinalIgnoreCase)) {
++            $relative = $path.Substring($physicalPrefix.Length)
++            if ($script:ScoopRestartPrimaryExecutables -contains $relative) { return $relative }
++        }
++    } catch { return }
++}
++
++function Invoke-ScoopPreparedRestart($Entry, $Global, $Executables) {
++    $installedVersion = Select-CurrentVersion -AppName $Entry.App -Global:$Global
++    $installedManifest = installed_manifest $Entry.App $installedVersion $Global
++    if ($installedVersion -ne $Entry.Version -or $installedManifest.version -ne $Entry.Version) { throw 'Updated installation could not be verified for relaunch.' }
++    $root = [IO.Path]::GetFullPath((versiondir $Entry.App $Entry.Version $Global)).TrimEnd('\')
++    $launchedExecutables = @{}
++    foreach ($relative in $Executables) {
++        if ($launchedExecutables.ContainsKey($relative)) { continue }
++        $launchedExecutables[$relative] = $true
++        $path = [IO.Path]::GetFullPath((Join-Path $root $relative))
++        if (!$path.StartsWith(($root + '\'), [StringComparison]::OrdinalIgnoreCase)) { throw 'Relaunch target escaped the new installation.' }
++        $cursor = $path
++        while ($cursor) {
++            $item = Get-Item -LiteralPath $cursor -Force -ErrorAction Stop
++            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Relaunch through reparse points is not permitted.' }
++            $parentPath = Split-Path $cursor -Parent
++            if ($parentPath -eq $cursor) { break }
++            $cursor = $parentPath
++        }
++        if (!(Test-Path -LiteralPath $path -PathType Leaf)) { throw 'Relaunch executable is missing.' }
++        try { Start-Process -FilePath $path -WindowStyle Hidden -ErrorAction Stop | Out-Null }
++        catch { warn "Update succeeded but relaunch failed: $_"; throw }
++    }
++}
++
+ function nightly_version($quiet = $false) {
+     if (!$quiet) {
+         warn "This is a nightly version. Downloaded files won't be verified."
+@@ -5,8 +95,20 @@ function nightly_version($quiet = $false) {
+     return "nightly-$(Get-Date -Format 'yyyyMMdd')"
+ }
+ 
+-function install_app($app, $architecture, $global, $suggested, $use_cache = $true, $check_hash = $true) {
+-    $app, $manifest, $bucket, $url = Get-Manifest $app
++function install_app($app, $architecture, $global, $suggested, $use_cache = $true, $check_hash = $true, $Prepared = $null) {
++    if ($Prepared) {
++        $ErrorActionPreference = 'Stop'
++        Assert-ScoopPreparedEntry $Prepared
++        $app = $Prepared.App
++        $manifest = $Prepared.Manifest
++        $bucket = $Prepared.Bucket
++        $url = $Prepared.Source
++        $architecture = $Prepared.Architecture
++        if ($Prepared.Offline) { Assert-ScoopOfflineManifest $manifest $architecture }
++        $null = Assert-ScoopPreparedPayload $Prepared
++    } else {
++        $app, $manifest, $bucket, $url = Get-Manifest $app
++    }
+ 
+     if (!$manifest) {
+         abort "Couldn't find manifest for '$app'$(if ($bucket) { " from '$bucket' bucket" } elseif ($url) { " at '$url'" })."
+@@ -49,7 +151,20 @@ function install_app($app, $architecture, $global, $suggested, $use_cache = $tru
+     $original_dir = $dir # keep reference to real (not linked) directory
+     $persist_dir = persistdir $app $global
+ 
+-    $fname = Invoke-ScoopDownload $app $version $manifest $bucket $architecture $dir $use_cache $check_hash
++    if ($Prepared) {
++        $fname = @()
++        foreach ($payloadUrl in @(script:url $manifest $architecture)) {
++            Assert-ScoopPreparedEntry $Prepared
++            $null = Assert-ScoopPreparedPayload $Prepared
++            $payloadName = url_filename $payloadUrl
++            Copy-Item -LiteralPath (cache_path $app $version $payloadUrl) -Destination (Join-Path $dir $payloadName) -ErrorAction Stop
++            $valid, $message = check_hash (Join-Path $dir $payloadName) (hash_for_url $manifest $payloadUrl $architecture) (show_app $app $bucket)
++            if (!$valid) { throw "Prepared payload changed: $message" }
++            $fname += $payloadName
++        }
++    } else {
++        $fname = Invoke-ScoopDownload $app $version $manifest $bucket $architecture $dir $use_cache $check_hash
++    }
+     Invoke-Extraction -Path $dir -Name $fname -Manifest $manifest -ProcessorArchitecture $architecture
+     Invoke-HookScript -HookType 'pre_install' -Manifest $manifest -ProcessorArchitecture $architecture
+ 
+@@ -69,7 +184,11 @@ function install_app($app, $architecture, $global, $suggested, $use_cache = $tru
+     Invoke-HookScript -HookType 'post_install' -Manifest $manifest -ProcessorArchitecture $architecture
+ 
+     # save info for uninstall
+-    save_installed_manifest $app $bucket $dir $url
++    if ($Prepared) {
++        $manifest | ConvertToPrettyJson | Out-UTF8File "$dir\scoop-manifest.json"
++    } else {
++        save_installed_manifest $app $bucket $dir $url
++    }
+     save_install_info @{ 'architecture' = $architecture; 'url' = $url; 'bucket' = $bucket } $dir
+ 
+     if ($manifest.suggest) {
+@@ -539,7 +658,15 @@ function test_running_process($app, $global) {
+         if (get_config KILL_RUNNING_PROCESSES) {
+             warn "The following instances of `"$app`" are still running. Scoop is configured to stop them."
+             Write-Host ($running_processes | Out-String)
+-            $running_processes | Stop-Process -Force -ErrorAction Stop
++            if ($script:ScoopRestartEnabled) {
++                foreach ($runningProcess in $running_processes) {
++                    $relative = Get-ScoopRestartCandidate $runningProcess $processdir
++                    $runningProcess | Stop-Process -Force -ErrorAction Stop
++                    if ($relative) { $script:ScoopRestartExecutables += $relative }
++                }
++            } else {
++                $running_processes | Stop-Process -Force -ErrorAction Stop
++            }
+             $running_processes | Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
+             $remaining_processes = @(Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($processPrefix, [StringComparison]::OrdinalIgnoreCase) })
+             if (!$remaining_processes) {
 diff --git a/libexec/scoop-cleanup.ps1 b/libexec/scoop-cleanup.ps1
 index 766d193f..566cd310 100644
 --- a/libexec/scoop-cleanup.ps1
@@ -731,11 +1105,94 @@ index 3122d9c3..2740ee51 100644
  # private_hosts:
  #       Array of private hosts that need additional authentication.
  #       For example, if you want to access a private GitHub repository,
+diff --git a/libexec/scoop-install.ps1 b/libexec/scoop-install.ps1
+index 051d361e..fd8e1cbd 100644
+--- a/libexec/scoop-install.ps1
++++ b/libexec/scoop-install.ps1
+@@ -20,6 +20,7 @@
+ #      scoop install \path\to\app.json@version
+ #
+ # Options:
++#       --offline                  Install only local manifests and verified cached payloads
+ #   -g, --global                    Install the app globally
+ #   -i, --independent               Don't install dependencies automatically
+ #   -k, --no-cache                  Don't use the download cache
+@@ -43,7 +44,7 @@ if (get_config USE_SQLITE_CACHE) {
+     . "$PSScriptRoot\..\lib\database.ps1"
+ }
+ 
+-$opt, $apps, $err = getopt $args 'giksua:' 'global', 'independent', 'no-cache', 'skip-hash-check', 'no-update-scoop', 'arch='
++$opt, $apps, $err = getopt $args 'giksua:' 'global', 'independent', 'no-cache', 'skip-hash-check', 'no-update-scoop', 'arch=', 'offline'
+ if ($err) { error "scoop install: $err"; exit 1 }
+ 
+ $global = $opt.g -or $opt.global
+@@ -63,6 +64,25 @@ if ($global -and !(is_admin)) {
+     abort 'ERROR: you need admin rights to install global apps'
+ }
+ 
++if ($opt.offline) {
++    if (!$use_cache -or !$check_hash) { abort 'Offline mode requires cache and hash verification.' }
++    try {
++        $plan = @(Get-ScoopOfflineInstallPlan $apps $architecture $global $independent)
++        $suggested = @{}
++        $previousOfflineMode = $script:ScoopOfflineMode
++        try {
++            $script:ScoopOfflineMode = $true
++            foreach ($entry in $plan) {
++                if (!(installed $entry.App $global)) {
++                    install_app $entry.Spec $entry.Architecture $global $suggested $true $true $entry
++                }
++            }
++        } finally { $script:ScoopOfflineMode = $previousOfflineMode }
++        show_suggestions $suggested
++    } catch { abort "Offline install failed: $_" }
++    exit 0
++}
++
+ if (is_scoop_outdated) {
+     if ($opt.u -or $opt.'no-update-scoop') {
+         warn "Scoop is out of date."
 diff --git a/libexec/scoop-update.ps1 b/libexec/scoop-update.ps1
-index 64ffcdab..ae6c5a57 100644
+index 64ffcdab..839316ea 100644
 --- a/libexec/scoop-update.ps1
 +++ b/libexec/scoop-update.ps1
-@@ -68,6 +68,7 @@ function Sync-Scoop {
+@@ -13,6 +13,10 @@
+ #   -s, --skip-hash-check  Skip hash validation (use with caution!)
+ #   -q, --quiet            Hide extraneous messages
+ #   -a, --all              Update all apps (alternative to '*')
++#       --prefetch         Prepare and verify the whole batch without installing
++#       --batch            Prepare every payload before stopping any app
++#       --offline          Install only verified local manifests and cache
++#       --restart          Relaunch eligible GUI apps actually stopped by update
+ 
+ . "$PSScriptRoot\..\lib\getopt.ps1"
+ . "$PSScriptRoot\..\lib\json.ps1" # 'save_install_info' in 'manifest.ps1' (indirectly)
+@@ -29,7 +33,7 @@ if (get_config USE_SQLITE_CACHE) {
+     . "$PSScriptRoot\..\lib\database.ps1"
+ }
+ 
+-$opt, $apps, $err = getopt $args 'gfiksqa' 'global', 'force', 'independent', 'no-cache', 'skip-hash-check', 'quiet', 'all'
++$opt, $apps, $err = getopt $args 'gfiksqa' 'global', 'force', 'independent', 'no-cache', 'skip-hash-check', 'quiet', 'all', 'prefetch', 'batch', 'offline', 'restart'
+ if ($err) { error "scoop update: $err"; exit 1 }
+ $global = $opt.g -or $opt.global
+ $force = $opt.f -or $opt.force
+@@ -38,6 +42,15 @@ $use_cache = !($opt.k -or $opt.'no-cache')
+ $quiet = $opt.q -or $opt.quiet
+ $independent = $opt.i -or $opt.independent
+ $all = $opt.a -or $opt.all
++$prefetch = $opt.prefetch
++$offline = $opt.offline
++$restart = $opt.restart
++$preparedMode = $opt.batch -or $prefetch -or $offline
++if ((($preparedMode -or $restart) -and (!$use_cache -or !$check_hash)) -or (($preparedMode -or $restart) -and !($apps -or $all))) {
++    error 'Prepared/restart options require apps; prepared updates require cache and hash verification.'
++    exit 1
++}
++if ($offline -and ($apps -contains 'scoop')) { error 'Offline update cannot update Scoop.'; exit 1 }
+ 
+ # load config
+ $configRepo = get_config SCOOP_REPO
+@@ -68,6 +81,7 @@ function Sync-Scoop {
      )
      # Test if Scoop Core is hold
      if (Test-ScoopCoreOnHold) {
@@ -743,7 +1200,7 @@ index 64ffcdab..ae6c5a57 100644
          return
      }
  
-@@ -82,6 +83,7 @@ function Sync-Scoop {
+@@ -82,6 +96,7 @@ function Sync-Scoop {
  
          # get git scoop
          Invoke-Git -ArgumentList @('clone', '-q', $configRepo, '--branch', $configBranch, '--single-branch', $newdir)
@@ -751,7 +1208,7 @@ index 64ffcdab..ae6c5a57 100644
  
          # check if scoop was successful downloaded
          if (!(Test-Path "$newdir\bin\scoop.ps1")) {
-@@ -116,6 +118,7 @@ function Sync-Scoop {
+@@ -116,6 +131,7 @@ function Sync-Scoop {
                  Invoke-Git -Path $currentdir -ArgumentList @('stash', 'push', '-m', "WIP at $([System.DateTime]::Now.ToString('o'))", '-u', '-q')
              } else {
                  warn 'Uncommitted changes detected. Update aborted.'
@@ -759,7 +1216,7 @@ index 64ffcdab..ae6c5a57 100644
                  return
              }
          }
-@@ -131,6 +134,7 @@ function Sync-Scoop {
+@@ -131,6 +147,7 @@ function Sync-Scoop {
              Invoke-Git -Path $currentdir -ArgumentList @('config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*')
              # fetch remote branch
              Invoke-Git -Path $currentdir -ArgumentList @('fetch', '--force', 'origin', "refs/heads/$configBranch`:refs/remotes/origin/$configBranch", '-q')
@@ -767,7 +1224,7 @@ index 64ffcdab..ae6c5a57 100644
              # checkout and track the branch
              Invoke-Git -Path $currentdir -ArgumentList @('checkout', '-B', $configBranch, '-t', "origin/$configBranch", '-q')
              # reset branch HEAD
-@@ -150,6 +154,7 @@ function Sync-Scoop {
+@@ -150,6 +167,7 @@ function Sync-Scoop {
      }
  
      shim "$currentdir\bin\scoop.ps1" $false
@@ -775,7 +1232,7 @@ index 64ffcdab..ae6c5a57 100644
  }
  
  function Sync-Bucket {
-@@ -157,21 +162,25 @@ function Sync-Bucket {
+@@ -157,21 +175,25 @@ function Sync-Bucket {
          [Switch]$Log
      )
      Write-Host 'Updating Buckets...'
@@ -809,7 +1266,7 @@ index 64ffcdab..ae6c5a57 100644
          $path = Find-BucketDirectory $_ -Root
          return @{
              name  = $_
-@@ -187,67 +196,96 @@ function Sync-Bucket {
+@@ -187,67 +209,96 @@ function Sync-Bucket {
      if ($PSVersionTable.PSVersion.Major -ge 7) {
          # Parallel parameter is available since PowerShell 7
          $buckets | Where-Object { $_.valid } | ForEach-Object -ThrottleLimit 5 -Parallel {
@@ -951,7 +1408,7 @@ index 64ffcdab..ae6c5a57 100644
              }
          }
      }
-@@ -256,6 +294,12 @@ function Sync-Bucket {
+@@ -256,9 +307,111 @@ function Sync-Bucket {
          Set-ScoopDB -Path $updatedFiles
          $removedFiles | Remove-ScoopDBItem
      }
@@ -961,10 +1418,174 @@ index 64ffcdab..ae6c5a57 100644
 +    } else {
 +        $global:LASTEXITCODE = 0
 +    }
++}
++
++function New-ScoopUpdatePlan($Targets, $Offline, $Independent, $Force) {
++    $entries = New-Object 'System.Collections.Generic.List[object]'
++    $seen = @{}
++    $visiting = @{}
++    function Resolve-ScoopUpdateEntry($Spec, $Architecture, $Global, $Target = $false) {
++        if ($Offline) {
++            $resolved = @(Get-ScoopOfflineInstallPlan @($Spec) $Architecture $Global $Independent)
++            foreach ($entry in $resolved) {
++                if (!$seen.ContainsKey($entry.App + '|' + $Global)) {
++                    $entry | Add-Member NoteProperty Global $Global
++                    $entry | Add-Member NoteProperty Update ($Target -and $entry.App -eq $targetApp)
++                    $entries.Add($entry)
++                    $seen[$entry.App + '|' + $Global] = $entry
++                } else {
++                    $existing = $seen[$entry.App + '|' + $Global]
++                    $existingIdentity = @($existing.App, $existing.Spec, $existing.Bucket, $existing.Source, $existing.Architecture, $existing.Version, ($existing.Manifest | ConvertTo-Json -Depth 100 -Compress)) -join "`n"
++                    $incomingIdentity = @($entry.App, $entry.Spec, $entry.Bucket, $entry.Source, $entry.Architecture, $entry.Version, ($entry.Manifest | ConvertTo-Json -Depth 100 -Compress)) -join "`n"
++                    if ($existingIdentity -cne $incomingIdentity) { throw "Conflicting prepared offline identity '$($entry.App)'." }
++                    if ($Target -and $entry.App -eq $targetApp) { $existing.Update = $true }
++                }
++            }
++            return
++        }
++        $name, $manifest, $bucket, $source = Get-Manifest $Spec
++        if (!$manifest) { throw "Missing update manifest '$Spec'." }
++        $manifest = $manifest | ConvertTo-Json -Depth 100 -Compress | ConvertFrom-Json
++        $arch = Get-SupportedArchitecture $manifest $Architecture
++        if (!$arch) { throw "Unsupported update architecture for '$name'." }
++        $probe = [pscustomobject]@{ App = $name; Version = $manifest.version; Manifest = $manifest; Architecture = $arch; Offline = $false }
++        Assert-ScoopOfflineManifest $manifest $arch $true
++        $key = $name + '|' + $Global
++        if ($visiting.ContainsKey($key)) { throw "Circular update dependency '$name'." }
++        if ($seen.ContainsKey($key)) {
++            if ($seen[$key].Spec -ne $Spec -or $seen[$key].Version -ne $manifest.version) { throw "Conflicting update source '$name'." }
++            if ($Target) { $seen[$key].Update = $true }
++            return
++        }
++        $visiting[$key] = $true
++        if (!$Independent) {
++            $dependencies = @($manifest.depends) + @(Get-InstallationHelper $manifest $arch -All | Where-Object { !(Test-HelperInstalled $_) })
++            foreach ($dependency in $dependencies) {
++                if (!$dependency) { continue }
++                $depApp, $null, $null = parse_app $dependency
++                if (!(installed $depApp)) { Resolve-ScoopUpdateEntry $dependency $arch $Global }
++            }
++        }
++        foreach ($payloadUrl in @(script:url $manifest $arch)) {
++            Invoke-CachedDownload $name $manifest.version $payloadUrl $null $manifest.cookie $true
++        }
++        $payloads = @(Assert-ScoopPreparedPayload $probe)
++        $entry = [pscustomobject]@{ App = $name; Spec = $Spec; Manifest = $manifest; Bucket = $bucket; Source = $source; Architecture = $arch; Version = $manifest.version; Offline = $false; Global = $Global; Update = $Target; Payloads = $payloads }
++        $entries.Add($entry)
++        $seen[$key] = $entry
++        $visiting.Remove($key)
++    }
++    foreach ($target in $Targets) {
++        $targetApp, $targetGlobal = $target
++        $oldVersion = Select-CurrentVersion -AppName $targetApp -Global:$targetGlobal
++        $installed = install_info $targetApp $oldVersion $targetGlobal
++        $arch = Format-ArchitectureString $installed.architecture
++        if ($Offline) {
++            if ($installed.url) { Assert-ScoopOfflineInput $installed.url }
++            Assert-ScoopOfflineManifest (installed_manifest $targetApp $oldVersion $targetGlobal) $arch
++        }
++        $spec = if ($installed.url) { $installed.url } elseif ($installed.bucket) { "$($installed.bucket)/$targetApp" } else { $targetApp }
++        if ($Force -and !$installed.bucket -and $installed.url -eq (usermanifest $targetApp)) { $spec = $targetApp }
++        Resolve-ScoopUpdateEntry $spec $arch $targetGlobal $true
++    }
++    foreach ($entry in $entries) {
++        $entry | Add-Member -Force NoteProperty Identity (@($entry.App, $entry.Spec, $entry.Bucket, $entry.Source, $entry.Architecture, $entry.Version, ($entry.Manifest | ConvertTo-Json -Depth 100 -Compress)) -join "`n")
++        Assert-ScoopPreparedEntry $entry
++    }
++    $ordered = New-Object 'System.Collections.Generic.List[object]'
++    $orderedKeys = @{}
++    $ordering = @{}
++    function Add-ScoopOrderedUpdate($Entry) {
++        $key = $Entry.App + '|' + $Entry.Global
++        if ($orderedKeys.ContainsKey($key)) { return }
++        if ($ordering.ContainsKey($key)) { throw 'Circular prepared target dependency.' }
++        $ordering[$key] = $true
++        if (!$Independent) {
++            foreach ($dependency in @($Entry.Manifest.depends) + @(Get-InstallationHelper $Entry.Manifest $Entry.Architecture -All)) {
++                if (!$dependency) { continue }
++                $dependencyApp, $null, $null = parse_app $dependency
++                $dependencyKey = $dependencyApp + '|' + $Entry.Global
++                if ($seen.ContainsKey($dependencyKey)) { Add-ScoopOrderedUpdate $seen[$dependencyKey] }
++            }
++        }
++        $ordering.Remove($key)
++        $orderedKeys[$key] = $true
++        $ordered.Add($Entry)
++    }
++    foreach ($entry in $entries) { Add-ScoopOrderedUpdate $entry }
++    return $ordered.ToArray()
  }
  
- function update($app, $global, $force = $false, $quiet = $false, $independent, $suggested, $use_cache = $true, $check_hash = $true) {
-@@ -403,7 +447,9 @@ if (-not ($apps -or $all)) {
+-function update($app, $global, $force = $false, $quiet = $false, $independent, $suggested, $use_cache = $true, $check_hash = $true) {
++function update($app, $global, $force = $false, $quiet = $false, $independent, $suggested, $use_cache = $true, $check_hash = $true, $Prepared = $null) {
+     $old_version = Select-CurrentVersion -AppName $app -Global:$global
+     $old_manifest = installed_manifest $app $old_version $global
+     $install = install_info $app $old_version $global
+@@ -268,6 +421,16 @@ function update($app, $global, $force = $false, $quiet = $false, $independent, $
+     $bucket = $install.bucket
+     $url = $install.url
+ 
++    if ($Prepared) {
++        $ErrorActionPreference = 'Stop'
++        Assert-ScoopPreparedEntry $Prepared
++        if ($Prepared.Offline) { Assert-ScoopOfflineManifest $old_manifest $Prepared.Architecture }
++        $manifest = $Prepared.Manifest
++        $architecture = $Prepared.Architecture
++        $bucket = $Prepared.Bucket
++        $url = $Prepared.Source
++        $pin_broken = $false
++    } else {
+     # -f on an @version pin re-resolves against the bucket HEAD
+     $pin_broken = $force -and $null -eq $bucket -and ($url -eq (usermanifest $app))
+     if ($pin_broken) {
+@@ -282,6 +445,7 @@ function update($app, $global, $force = $false, $quiet = $false, $independent, $
+         if ($null -eq $bucket -and !$url) { $bucket = 'main' }
+         $manifest = manifest $app $bucket $url
+     }
++    }
+     $version = $manifest.version
+     $is_nightly = $version -eq 'nightly'
+     if ($is_nightly) {
+@@ -306,6 +470,10 @@ function update($app, $global, $force = $false, $quiet = $false, $independent, $
+     # region Workaround
+     # Workaround for https://github.com/ScoopInstaller/Scoop/issues/2220 until install is refactored
+     # Remove and replace whole region after proper fix
++    if ($Prepared) {
++        Assert-ScoopPreparedEntry $Prepared
++        $null = Assert-ScoopPreparedPayload $Prepared
++    } else {
+     Write-Host 'Downloading new version'
+     if (Test-Aria2Enabled) {
+         Invoke-CachedAria2Download $app $version $manifest $architecture $cachedir $manifest.cookie $true $check_hash
+@@ -336,8 +504,13 @@ function update($app, $global, $force = $false, $quiet = $false, $independent, $
+     }
+     # There is no need to check hash again while installing
+     $check_hash = $false
++    }
+     # endregion Workaround
+ 
++    if ($Prepared -and $script:ScoopRestartEnabled) {
++        $oldPrimaryExecutables = @(Get-ScoopRestartPrimaryExecutable $old_manifest $architecture)
++        $script:ScoopRestartPrimaryExecutables = @(Get-ScoopRestartPrimaryExecutable $Prepared.Manifest $architecture | Where-Object { $oldPrimaryExecutables -contains $_ })
++    }
+     # Keep the app running until downloads and hash validation have succeeded.
+     if (test_running_process $app $global) {
+         Write-Host 'Running process detected, skip updating.'
+@@ -384,7 +557,12 @@ function update($app, $global, $force = $false, $quiet = $false, $independent, $
+         $app = $install.url
+     }
+ 
+-    if ($independent) {
++    if ($Prepared) {
++        install_app $Prepared.App $architecture $global $suggested $true $true $Prepared
++        if ($script:ScoopRestartEnabled -and $script:ScoopRestartExecutables) {
++            Invoke-ScoopPreparedRestart $Prepared $global $script:ScoopRestartExecutables
++        }
++    } elseif ($independent) {
+         install_app $app $architecture $global $suggested $use_cache $check_hash
+     } else {
+         # Also add missing dependencies
+@@ -403,7 +581,9 @@ if (-not ($apps -or $all)) {
          exit 1
      }
      Sync-Scoop -Log:$show_update_log
@@ -974,7 +1595,14 @@ index 64ffcdab..ae6c5a57 100644
      set_config LAST_UPDATE ([System.DateTime]::Now.ToString('o')) | Out-Null
      success 'Scoop was updated successfully!'
  } else {
-@@ -418,7 +464,9 @@ if (-not ($apps -or $all)) {
+@@ -412,13 +592,15 @@ if (-not ($apps -or $all)) {
+     }
+ 
+     $outdated = @()
+-    $updateScoop = $null -ne ($apps | Where-Object { $_ -eq 'scoop' }) -or (is_scoop_outdated)
++    $updateScoop = !$offline -and ($null -ne ($apps | Where-Object { $_ -eq 'scoop' }) -or (is_scoop_outdated))
+     $apps = $apps | Where-Object { $_ -ne 'scoop' }
+     $apps_param = $apps
  
      if ($updateScoop) {
          Sync-Scoop -Log:$show_update_log
@@ -984,3 +1612,53 @@ index 64ffcdab..ae6c5a57 100644
          set_config LAST_UPDATE ([System.DateTime]::Now.ToString('o')) | Out-Null
          success 'Scoop was updated successfully!'
      }
+@@ -436,7 +618,16 @@ if (-not ($apps -or $all)) {
+     if ($apps) {
+         $apps | ForEach-Object {
+             ($app, $global) = $_
+-            $status = app_status $app $global
++            if ($offline) {
++                $currentVersion = Select-CurrentVersion -AppName $app -Global:$global
++                $currentInfo = install_info $app $currentVersion $global
++                if ($currentInfo.url) { Assert-ScoopOfflineInput $currentInfo.url }
++                $spec = if ($currentInfo.url) { $currentInfo.url } elseif ($currentInfo.bucket) { "$($currentInfo.bucket)/$app" } else { $app }
++                $latestEntry = Get-ScoopOfflineManifestEntry $spec (Format-ArchitectureString $currentInfo.architecture)
++                $status = [pscustomobject]@{ installed = $true; version = $currentVersion; latest_version = $latestEntry.Version; outdated = $currentVersion -ne $latestEntry.Version; hold = ($currentInfo.hold -eq $true) }
++            } else {
++                $status = app_status $app $global
++            }
+             # -f on an @version pin upgrades to the bucket HEAD; the target
+             # version is resolved (and warned) by update(), not guessed here
+             $ver = Select-CurrentVersion -AppName $app -Global:$global
+@@ -476,7 +667,30 @@ if (-not ($apps -or $all)) {
+ 
+     $suggested = @{}
+     # $outdated is a list of ($app, $global) tuples
+-    $outdated | ForEach-Object { update @_ $force $quiet $independent $suggested $use_cache $check_hash }
++    if ($preparedMode -or $restart) {
++        $previousOfflineMode = $script:ScoopOfflineMode
++        try {
++            $plan = @(New-ScoopUpdatePlan $outdated $offline $independent $force)
++            foreach ($entry in $plan) { $null = Assert-ScoopPreparedPayload $entry }
++            if (!$prefetch) {
++                $script:ScoopOfflineMode = [bool]$offline
++                foreach ($entry in $plan) {
++                    $script:ScoopRestartExecutables = @()
++                    $script:ScoopRestartPrimaryExecutables = @()
++                    $script:ScoopRestartEnabled = [bool]$restart
++                    if ($entry.Update) { update $entry.App $entry.Global $force $quiet $true $suggested $true $true $entry }
++                    else { install_app $entry.App $entry.Architecture $entry.Global $suggested $true $true $entry }
++                }
++            }
++        } finally {
++            $script:ScoopOfflineMode = $previousOfflineMode
++            $script:ScoopRestartEnabled = $false
++            $script:ScoopRestartExecutables = @()
++            $script:ScoopRestartPrimaryExecutables = @()
++        }
++    } else {
++        $outdated | ForEach-Object { update @_ $force $quiet $independent $suggested $use_cache $check_hash }
++    }
+ }
+ 
+ exit 0

@@ -9,9 +9,11 @@ param(
 
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version 2.0
-$allowedPaths = @('lib/install.ps1', 'libexec/scoop-config.ps1', 'libexec/scoop-update.ps1', 'libexec/scoop-cleanup.ps1', 'bin/scoop.ps1', 'lib/core.ps1')
+$allowedPaths = @('lib/install.ps1', 'libexec/scoop-config.ps1', 'libexec/scoop-update.ps1', 'libexec/scoop-cleanup.ps1', 'bin/scoop.ps1', 'lib/core.ps1', 'lib/download.ps1', 'libexec/scoop-install.ps1')
 $legacyPaths = $allowedPaths[0..3]
-$upgradePaths = @($allowedPaths | Where-Object { $_ -ne 'lib/install.ps1' })
+$upgradePaths = $allowedPaths
+$legacyV2Paths = $allowedPaths[0..5]
+$upgradeV2Paths = @('lib/install.ps1', 'libexec/scoop-update.ps1', 'lib/download.ps1', 'libexec/scoop-install.ps1')
 
 function Assert-UnlinkedPath {
     param([string]$Path)
@@ -107,13 +109,17 @@ Assert-UnlinkedPath $metadataPath
 $metadata = Get-Content -LiteralPath $metadataPath -Raw | ConvertFrom-Json
 if ($metadata.repository -cne 'https://github.com/ScoopInstaller/Scoop' -or
     $metadata.revision -cnotmatch '^[0-9a-f]{40}$' -or $metadata.patch -cne 'patches/local-extensions.patch' -or
-    $metadata.bundle_version -cne '0.2.0' -or $metadata.legacy_patch -cne 'patches/local-extensions-v1.patch' -or
-    $metadata.upgrade_patch -cne 'patches/upgrade-v1.patch') {
+    $metadata.bundle_version -cne '0.3.0' -or $metadata.legacy_patch -cne 'patches/local-extensions-v1.patch' -or
+    $metadata.upgrade_patch -cne 'patches/upgrade-v1.patch' -or
+    $metadata.legacy_v2_patch -cne 'patches/local-extensions-v2.patch' -or
+    $metadata.upgrade_v2_patch -cne 'patches/upgrade-v2.patch') {
     throw 'Invalid upstream metadata or patch location.'
 }
 $patchPath = Get-ValidatedPatch $metadata.patch $allowedPaths
 $legacyPatchPath = Get-ValidatedPatch $metadata.legacy_patch $legacyPaths
 $upgradePatchPath = Get-ValidatedPatch $metadata.upgrade_patch $upgradePaths
+$legacyV2PatchPath = Get-ValidatedPatch $metadata.legacy_v2_patch $legacyV2Paths
+$upgradeV2PatchPath = Get-ValidatedPatch $metadata.upgrade_v2_patch $upgradeV2Paths
 foreach ($relativePath in $allowedPaths) {
     $sourcePath = Join-Path $targetRoot $relativePath
     if (-not (Test-Path -LiteralPath $sourcePath -PathType Leaf)) { throw "Missing source file: $relativePath" }
@@ -129,12 +135,21 @@ $checkStatus = 'Applicable'
 if ($forward.ExitCode -ne 0) {
     $reverse = Invoke-TargetGit @('apply', '--check', '--reverse', '--', $patchPath)
     if ($reverse.ExitCode -eq 0) { New-ApplyResult 'AlreadyApplied'; return }
-    $legacy = Invoke-TargetGit @('apply', '--check', '--reverse', '--', $legacyPatchPath)
-    $upgrade = Invoke-TargetGit @('apply', '--check', '--', $upgradePatchPath)
-    if ($legacy.ExitCode -ne 0 -or $upgrade.ExitCode -ne 0) {
+    $selectedPatch = $null
+    foreach ($candidate in @(
+        @{ Legacy = $legacyPatchPath; Upgrade = $upgradePatchPath },
+        @{ Legacy = $legacyV2PatchPath; Upgrade = $upgradeV2PatchPath }
+    )) {
+        $legacy = Invoke-TargetGit @('apply', '--check', '--reverse', '--', $candidate.Legacy)
+        $upgrade = Invoke-TargetGit @('apply', '--check', '--', $candidate.Upgrade)
+        if ($legacy.ExitCode -eq 0 -and $upgrade.ExitCode -eq 0) {
+            $selectedPatch = $candidate.Upgrade
+            break
+        }
+    }
+    if (-not $selectedPatch) {
         throw 'Patch compatibility check failed. The source tree may have upstream drift or only part of a bundle. No files were changed; review local changes manually.'
     }
-    $selectedPatch = $upgradePatchPath
     $appliedStatus = 'Upgraded'
     $checkStatus = 'UpgradeApplicable'
 }

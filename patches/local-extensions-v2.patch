@@ -1,0 +1,1320 @@
+diff --git a/bin/scoop.ps1 b/bin/scoop.ps1
+index 036a05ba..52b374fd 100644
+--- a/bin/scoop.ps1
++++ b/bin/scoop.ps1
+@@ -6,6 +6,210 @@ Set-StrictMode -Off
+ . "$PSScriptRoot\..\lib\commands.ps1"
+ . "$PSScriptRoot\..\lib\help.ps1"
+ 
++function Get-ScoopOperationScope {
++    param([string]$Command, [string[]]$Arguments)
++    $mutating = $true
++    if (!$Command -or $Command -in @('-h', '--help', '/?', '-v', '--version', 'help', 'list', 'search', 'status', 'info', 'cat', 'prefix', 'which', 'depends', 'export', 'home')) {
++        $mutating = $false
++    } elseif ($Arguments.Count -gt 0 -and $Arguments[0] -in @('-h', '--help', '/?')) {
++        $mutating = $false
++    } else {
++        switch ($Command) {
++            'config' { $mutating = $Arguments.Count -gt 1 -or ($Arguments.Count -gt 0 -and $Arguments[0] -eq 'rm') }
++            'bucket' { $mutating = $Arguments.Count -gt 0 -and $Arguments[0] -notin @('list', 'known') }
++            'cache' { $mutating = $Arguments.Count -gt 0 -and $Arguments[0] -eq 'rm' }
++            'alias' { $mutating = $Arguments.Count -gt 0 -and $Arguments[0] -ne 'list' }
++            'shim' { $mutating = $Arguments.Count -gt 0 -and $Arguments[0] -notin @('list', 'info') }
++        }
++    }
++    $globalOperation = $false
++    foreach ($argument in $Arguments) {
++        if ($argument -in @('--', '--%')) { break }
++        if ($Command -eq 'cleanup' -and $argument -eq '--dry-run') { $mutating = $false }
++        if ($argument -eq '--global' -or $argument -cmatch '^-[A-Za-z]*g[A-Za-z]*$') { $globalOperation = $true }
++    }
++    $importStream = $null
++    if ($mutating -and $Command -eq 'import' -and $Arguments.Count -gt 0) {
++        if ($Arguments[0] -match '^(ht|f)tps?://|^\\\\') {
++            throw 'Download the Scoopfile to a local file before importing so its operation lock scope can be verified without network access.'
++        }
++        try {
++            $inputPath = (Get-Item -LiteralPath $Arguments[0] -ErrorAction Stop).FullName
++            $importStream = [IO.File]::Open($inputPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
++            $reader = New-Object IO.StreamReader($importStream, [Text.Encoding]::UTF8, $true, 1024, $true)
++            try { $importData = $reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop }
++            finally { $reader.Dispose() }
++            if (!$importData) { throw 'Input file not a valid JSON.' }
++            foreach ($app in $importData.apps) {
++                if ('Global install' -in ($app.Info -split ', ')) { $globalOperation = $true }
++            }
++        } catch {
++            if ($importStream) { $importStream.Dispose() }
++            throw
++        }
++    }
++    [PSCustomObject]@{ Mutating = $mutating; Global = $globalOperation; ImportStream = $importStream }
++}
++
++function Get-ScoopOperationLockPath {
++    param([string]$Root)
++    if (!$Root -or ![IO.Path]::IsPathRooted($Root)) { throw 'Operation lock requires an absolute, existing Scoop root.' }
++    $directory = Get-Item -LiteralPath ([IO.Path]::GetFullPath($Root)) -Force -ErrorAction Stop
++    if (!$directory.PSIsContainer -or $directory.PSProvider.Name -ne 'FileSystem') { throw 'Operation lock root must be a physical directory.' }
++    $ancestor = $directory
++    while ($ancestor) {
++        if ($ancestor.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw 'Operation lock refuses redirected Scoop roots.' }
++        if (Test-Path -LiteralPath (Join-Path $ancestor.FullName '.git')) { throw 'Operation lock must be outside a Git worktree.' }
++        $ancestor = $ancestor.Parent
++    }
++    $path = Join-Path $directory.FullName '.scoop-operation.lock'
++    if (Test-Path -LiteralPath $path) {
++        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
++        if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) { throw 'Operation lock refuses a redirected lock file.' }
++    }
++    $path
++}
++
++function Test-ScoopOperationLockHandle {
++    param([IO.FileStream]$Stream, [string]$Path)
++    if (!('ScoopOperationLockNative' -as [type])) {
++        Add-Type -TypeDefinition @'
++using System;
++using System.Runtime.InteropServices;
++using System.Text;
++using Microsoft.Win32.SafeHandles;
++public static class ScoopOperationLockNative {
++    [StructLayout(LayoutKind.Sequential)]
++    public struct Information {
++        public uint Attributes;
++        public System.Runtime.InteropServices.ComTypes.FILETIME Creation, Access, Write;
++        public uint Volume, SizeHigh, SizeLow, Links, IndexHigh, IndexLow;
++    }
++    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
++    public static extern uint GetFinalPathNameByHandle(SafeFileHandle handle, StringBuilder path, uint size, uint flags);
++    [DllImport("kernel32.dll", SetLastError = true)]
++    public static extern bool GetFileInformationByHandle(SafeFileHandle handle, out Information information);
++}
++'@ -ErrorAction Stop
++    }
++    $buffer = New-Object Text.StringBuilder 32768
++    $length = [ScoopOperationLockNative]::GetFinalPathNameByHandle($Stream.SafeFileHandle, $buffer, $buffer.Capacity, 0)
++    $information = New-Object ScoopOperationLockNative+Information
++    if (!$length -or $length -ge $buffer.Capacity -or ![ScoopOperationLockNative]::GetFileInformationByHandle($Stream.SafeFileHandle, [ref]$information)) {
++        throw 'Cannot verify the physical operation lock file.'
++    }
++    $physicalPath = $buffer.ToString()
++    if ($physicalPath.StartsWith('\\?\UNC\')) { $physicalPath = '\\' + $physicalPath.Substring(8) }
++    elseif ($physicalPath.StartsWith('\\?\')) { $physicalPath = $physicalPath.Substring(4) }
++    if (![string]::Equals($physicalPath, $Path, [StringComparison]::OrdinalIgnoreCase) -or $information.Links -ne 1) {
++        throw 'Operation lock refuses redirected or hard-linked lock files.'
++    }
++}
++
++function Read-ScoopOperationLockOwner {
++    param([string]$Path)
++    $reader = $null
++    try {
++        $reader = New-Object IO.StreamReader ([IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite))
++        if ($reader.BaseStream.Length -le 4096) { $reader.ReadToEnd() | ConvertFrom-Json -ErrorAction Stop }
++    } catch {
++    } finally {
++        if ($reader) { $reader.Dispose() }
++    }
++}
++
++function Enter-ScoopOperationLock {
++    param(
++        [string]$UserRoot,
++        [string]$GlobalRoot,
++        [switch]$Global,
++        [string]$Command,
++        [double]$TimeoutSeconds = 30
++    )
++    if ([double]::IsNaN($TimeoutSeconds) -or [double]::IsInfinity($TimeoutSeconds) -or $TimeoutSeconds -lt 0 -or $TimeoutSeconds -gt [int]::MaxValue) {
++        throw 'operation_lock_timeout must be a finite non-negative number of seconds (zero fails fast).'
++    }
++    if (!(Get-Variable ScoopOperationLockState -Scope Global -ErrorAction SilentlyContinue)) { $global:ScoopOperationLockState = @{} }
++    $userPath = Get-ScoopOperationLockPath $UserRoot
++    $paths = @($userPath)
++    if ($Global) {
++        $globalPath = Get-ScoopOperationLockPath $GlobalRoot
++        if ($globalPath -ne $userPath) {
++            if ($global:ScoopOperationLockState.ContainsKey($userPath) -and !$global:ScoopOperationLockState.ContainsKey($globalPath)) {
++                throw 'A nested global Scoop operation cannot upgrade a local lease. Run the global operation separately.'
++            }
++            $paths = @($globalPath, $userPath)
++        }
++    }
++    $acquired = New-Object Collections.ArrayList
++    $clock = [Diagnostics.Stopwatch]::StartNew()
++    $processStart = (Get-Process -Id $PID).StartTime.ToUniversalTime()
++    $marker = "$PID|$($processStart.Ticks)"
++    try {
++        foreach ($path in $paths) {
++            if ($global:ScoopOperationLockState.ContainsKey($path)) {
++                $global:ScoopOperationLockState[$path].Depth++
++                [void]$acquired.Add($path)
++                continue
++            }
++            $stream = $null
++            while (!$stream) {
++                $null = Get-ScoopOperationLockPath (Split-Path $path -Parent)
++                try {
++                    $stream = [IO.File]::Open($path, [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::Read)
++                } catch [IO.IOException] {
++                    if (($_.Exception.HResult -band 0xffff) -notin @(32, 33)) { throw }
++                    $owner = Read-ScoopOperationLockOwner $path
++                    $ownerMarker = if ($owner) { "$($owner.pid)|$($owner.start_ticks)" } else { '' }
++                    if ($ownerMarker -and $env:SCOOP_OPERATION_LOCK_PARENT -eq $ownerMarker) {
++                        throw "Nested Scoop process cannot wait for ancestor PID $($owner.pid). Run this command after the outer operation finishes."
++                    }
++                    if ($clock.Elapsed.TotalSeconds -ge $TimeoutSeconds) {
++                        $ownerInfo = if ($owner) { "PID $($owner.pid), started $($owner.start_time), command $($owner.command)" } else { 'owner information unavailable' }
++                        throw "Scoop operation lock timed out: $ownerInfo. Wait for the operation to finish; no process was stopped."
++                    }
++                    $remaining = ($TimeoutSeconds - $clock.Elapsed.TotalSeconds) * 1000
++                    Start-Sleep -Milliseconds ([int][Math]::Max(1, [Math]::Min(100, $remaining)))
++                }
++            }
++            try {
++                Test-ScoopOperationLockHandle $stream $path
++                $safeCommand = if ($Command -match '^[a-zA-Z][a-zA-Z0-9_-]{0,63}$') { $Command } else { 'custom-command' }
++                $metadata = @{ pid = $PID; start_time = $processStart.ToString('o'); start_ticks = $processStart.Ticks; command = $safeCommand } | ConvertTo-Json -Compress
++                $bytes = [Text.Encoding]::UTF8.GetBytes($metadata)
++                $stream.SetLength(0)
++                $stream.Write($bytes, 0, $bytes.Length)
++                $stream.Flush()
++                $global:ScoopOperationLockState[$path] = @{ Stream = $stream; Depth = 1 }
++                [void]$acquired.Add($path)
++            } catch { $stream.Dispose(); throw }
++        }
++        $lease = [PSCustomObject]@{ Paths = @($acquired); PreviousParent = $env:SCOOP_OPERATION_LOCK_PARENT }
++        $env:SCOOP_OPERATION_LOCK_PARENT = $marker
++        $lease
++    } catch {
++        Exit-ScoopOperationLock ([PSCustomObject]@{ Paths = @($acquired); PreviousParent = $env:SCOOP_OPERATION_LOCK_PARENT })
++        throw
++    }
++}
++
++function Exit-ScoopOperationLock {
++    param($Lease)
++    if (!$Lease) { return }
++    for ($index = $Lease.Paths.Count - 1; $index -ge 0; $index--) {
++        $path = $Lease.Paths[$index]
++        $state = $global:ScoopOperationLockState[$path]
++        if ($state) {
++            $state.Depth--
++            if ($state.Depth -eq 0) {
++                $state.Stream.Dispose()
++                $global:ScoopOperationLockState.Remove($path)
++            }
++        }
++    }
++    $env:SCOOP_OPERATION_LOCK_PARENT = $Lease.PreviousParent
++}
++
+ $subCommand = $Args[0]
+ 
+ # for aliases where there's a local function, re-alias so the function takes precedence
+@@ -43,7 +247,22 @@ switch ($subCommand) {
+         if ($null -ne $arguments -and $arguments[0] -in @('-h', '--help', '/?')) {
+             exec 'help' @($subCommand)
+         } else {
+-            exec $subCommand $arguments
++            $operationScope = Get-ScoopOperationScope $subCommand $arguments
++            if (!$operationScope.Mutating) {
++                exec $subCommand $arguments
++            } else {
++                $operationLease = $null
++                try {
++                    $operationLease = Enter-ScoopOperationLock -UserRoot $scoopdir -GlobalRoot $globaldir -Global:$operationScope.Global -Command $subCommand -TimeoutSeconds (get_config OPERATION_LOCK_TIMEOUT 30)
++                    $global:LASTEXITCODE = 0
++                    exec $subCommand $arguments
++                    $operationExitCode = $LASTEXITCODE
++                } finally {
++                    Exit-ScoopOperationLock $operationLease
++                    if ($operationScope.ImportStream) { $operationScope.ImportStream.Dispose() }
++                }
++                exit $operationExitCode
++            }
+         }
+     }
+     default {
+diff --git a/lib/core.ps1 b/lib/core.ps1
+index 7ca74ceb..d7b26140 100644
+--- a/lib/core.ps1
++++ b/lib/core.ps1
+@@ -234,6 +234,162 @@ function Complete-ConfigChange {
+     }
+ }
+ 
++function Test-GitNetworkCommand {
++    param([String[]]$ArgumentList)
++    for ($index = 0; $index -lt $ArgumentList.Count; $index++) {
++        $argument = $ArgumentList[$index]
++        if ($argument -in @('-C', '-c', '--git-dir', '--work-tree', '--namespace', '--config-env', '--super-prefix')) {
++            $index++
++            continue
++        }
++        if ($argument -in @('--help', '-h', '--version', '-v', '--')) { return $false }
++        if ($argument.StartsWith('-')) { continue }
++        return $argument -cin @('clone', 'fetch', 'pull', 'ls-remote')
++    }
++    return $false
++}
++
++function ConvertTo-GitCommandLine {
++    param([String[]]$ArgumentList)
++    $quoted = foreach ($argument in $ArgumentList) {
++        '"' + ([regex]::Replace([regex]::Replace($argument, '(\\*)"', '$1$1\"'), '(\\+)$', '$1$1')) + '"'
++    }
++    return $quoted -join ' '
++}
++
++function Initialize-GitNetworkJob {
++    if ('ScoopGitNetworkJob' -as [Type]) { return }
++    [System.Threading.Monitor]::Enter([AppDomain]::CurrentDomain)
++    try {
++        if ('ScoopGitNetworkJob' -as [Type]) { return }
++        Add-Type -TypeDefinition @"
++using System;
++using System.Collections;
++using System.Collections.Generic;
++using System.ComponentModel;
++using System.Diagnostics;
++using System.IO;
++using System.Runtime.InteropServices;
++using System.Text;
++using Microsoft.Win32.SafeHandles;
++public sealed class ScoopGitNetworkJob : IDisposable {
++    [StructLayout(LayoutKind.Sequential)] struct SecurityAttributes {
++        public int Length; public IntPtr Descriptor; [MarshalAs(UnmanagedType.Bool)] public bool Inherit;
++    }
++    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)] struct StartupInfo {
++        public int Size; public string Reserved; public string Desktop; public string Title;
++        public int X, Y, XSize, YSize, XCountChars, YCountChars, FillAttribute, Flags;
++        public short ShowWindow, ReservedSize; public IntPtr ReservedPointer, Input, Output, Error;
++    }
++    [StructLayout(LayoutKind.Sequential)] struct StartupInfoEx { public StartupInfo Info; public IntPtr Attributes; }
++    [StructLayout(LayoutKind.Sequential)] struct ProcessInformation { public IntPtr Process, Thread; public int ProcessId, ThreadId; }
++    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
++    public static extern IntPtr CreateJobObject(IntPtr attributes, string name);
++    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
++    public static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
++    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
++    public static extern bool TerminateJobObject(IntPtr job, uint exitCode);
++    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
++    public static extern bool CloseHandle(IntPtr handle);
++    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
++    static extern bool CreatePipe(out IntPtr read, out IntPtr write, ref SecurityAttributes attributes, int size);
++    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
++    static extern bool SetHandleInformation(IntPtr handle, uint mask, uint flags);
++    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
++    static extern IntPtr CreateFile(string name, uint access, uint share, ref SecurityAttributes attributes, uint creation, uint flags, IntPtr template);
++    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
++    static extern bool InitializeProcThreadAttributeList(IntPtr list, int count, int flags, ref IntPtr size);
++    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
++    static extern bool UpdateProcThreadAttribute(IntPtr list, uint flags, IntPtr attribute, IntPtr value, IntPtr size, IntPtr previous, IntPtr returnedSize);
++    [DllImport("kernel32.dll")] static extern void DeleteProcThreadAttributeList(IntPtr list);
++    [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
++    static extern bool CreateProcess(string application, StringBuilder command, IntPtr processAttributes, IntPtr threadAttributes,
++        bool inherit, uint flags, IntPtr environment, string directory, ref StartupInfoEx startup, out ProcessInformation information);
++    [DllImport("kernel32.dll", SetLastError = true)] static extern uint ResumeThread(IntPtr thread);
++    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
++    static extern bool TerminateProcess(IntPtr process, uint code);
++    [DllImport("kernel32.dll")] static extern uint WaitForSingleObject(IntPtr handle, uint milliseconds);
++    [DllImport("kernel32.dll", SetLastError = true)] [return: MarshalAs(UnmanagedType.Bool)]
++    static extern bool GetExitCodeProcess(IntPtr process, out uint code);
++    IntPtr process;
++    public StreamReader StandardOutput { get; private set; }
++    public StreamReader StandardError { get; private set; }
++    public bool HasExited { get { return WaitForSingleObject(process, 0) == 0; } }
++    public int ExitCode { get { uint code; if (!GetExitCodeProcess(process, out code)) throw Failure(); return unchecked((int)code); } }
++    static Exception Failure() { return new Win32Exception(Marshal.GetLastWin32Error(), "Unable to start the isolated Git process."); }
++    static void Close(ref IntPtr handle) { if (handle != IntPtr.Zero && handle != new IntPtr(-1)) CloseHandle(handle); handle = IntPtr.Zero; }
++    static StreamReader Reader(ref IntPtr handle) {
++        var safe = new SafeFileHandle(handle, true); handle = IntPtr.Zero;
++        try { return new StreamReader(new FileStream(safe, FileAccess.Read, 4096, false), Console.OutputEncoding, true); }
++        catch { safe.Dispose(); throw; }
++    }
++    public static ScoopGitNetworkJob Start(ProcessStartInfo start, IntPtr job) {
++        IntPtr outputRead = IntPtr.Zero, outputWrite = IntPtr.Zero, errorRead = IntPtr.Zero, errorWrite = IntPtr.Zero;
++        IntPtr input = IntPtr.Zero, list = IntPtr.Zero, handles = IntPtr.Zero, environment = IntPtr.Zero;
++        bool initialized = false, resumed = false;
++        var information = new ProcessInformation();
++        ScoopGitNetworkJob child = null;
++        try {
++            var security = new SecurityAttributes(); security.Length = Marshal.SizeOf(security); security.Inherit = true;
++            if (!CreatePipe(out outputRead, out outputWrite, ref security, 0) || !SetHandleInformation(outputRead, 1, 0)) throw Failure();
++            if (!CreatePipe(out errorRead, out errorWrite, ref security, 0) || !SetHandleInformation(errorRead, 1, 0)) throw Failure();
++            input = CreateFile("NUL", 0x80000000, 3, ref security, 3, 0, IntPtr.Zero);
++            if (input == new IntPtr(-1)) throw Failure();
++            IntPtr size = IntPtr.Zero;
++            InitializeProcThreadAttributeList(IntPtr.Zero, 1, 0, ref size);
++            list = Marshal.AllocHGlobal(size);
++            if (!InitializeProcThreadAttributeList(list, 1, 0, ref size)) throw Failure();
++            initialized = true;
++            handles = Marshal.AllocHGlobal(IntPtr.Size * 3);
++            Marshal.WriteIntPtr(handles, 0, input); Marshal.WriteIntPtr(handles, IntPtr.Size, outputWrite); Marshal.WriteIntPtr(handles, IntPtr.Size * 2, errorWrite);
++            if (!UpdateProcThreadAttribute(list, 0, new IntPtr(0x20002), handles, new IntPtr(IntPtr.Size * 3), IntPtr.Zero, IntPtr.Zero)) throw Failure();
++            var variables = new List<string>();
++            foreach (DictionaryEntry entry in start.EnvironmentVariables) variables.Add((string)entry.Key + "=" + (string)entry.Value);
++            variables.Sort(StringComparer.OrdinalIgnoreCase);
++            environment = Marshal.StringToHGlobalUni(String.Join("\0", variables.ToArray()) + "\0\0");
++            var startup = new StartupInfoEx(); startup.Info.Size = Marshal.SizeOf(startup); startup.Info.Flags = 0x100; startup.Attributes = list;
++            startup.Info.Input = input; startup.Info.Output = outputWrite; startup.Info.Error = errorWrite;
++            var command = new StringBuilder("\"" + start.FileName + "\" " + start.Arguments);
++            // Suspended creation makes job membership precede all executable child code.
++            if (!CreateProcess(start.FileName, command, IntPtr.Zero, IntPtr.Zero, true, 0x08080404, environment, start.WorkingDirectory, ref startup, out information)) throw Failure();
++            if (!AssignProcessToJobObject(job, information.Process)) throw Failure();
++            child = new ScoopGitNetworkJob(); child.process = information.Process;
++            child.StandardOutput = Reader(ref outputRead); child.StandardError = Reader(ref errorRead);
++            if (ResumeThread(information.Thread) == UInt32.MaxValue) throw Failure();
++            resumed = true; information.Process = IntPtr.Zero;
++            return child;
++        } finally {
++            if (!resumed && information.Process != IntPtr.Zero) {
++                TerminateProcess(information.Process, 1); WaitForSingleObject(information.Process, 2000);
++                if (child != null) { child.process = IntPtr.Zero; child.Dispose(); }
++            }
++            Close(ref information.Process); Close(ref information.Thread);
++            Close(ref outputRead); Close(ref outputWrite); Close(ref errorRead); Close(ref errorWrite); Close(ref input);
++            if (initialized) DeleteProcThreadAttributeList(list);
++            if (list != IntPtr.Zero) Marshal.FreeHGlobal(list);
++            if (handles != IntPtr.Zero) Marshal.FreeHGlobal(handles);
++            if (environment != IntPtr.Zero) Marshal.FreeHGlobal(environment);
++        }
++    }
++    public void Dispose() {
++        if (StandardOutput != null) StandardOutput.Dispose();
++        if (StandardError != null) StandardError.Dispose();
++        Close(ref process);
++    }
++}
++"@ -ErrorAction Stop
++    } finally {
++        [System.Threading.Monitor]::Exit([AppDomain]::CurrentDomain)
++    }
++}
++
++function Stop-GitProcessTree {
++    param([IntPtr]$Job)
++    if ($Job -ne [IntPtr]::Zero -and ![ScoopGitNetworkJob]::TerminateJobObject($Job, 124)) {
++        throw 'Unable to terminate the isolated Git process tree.'
++    }
++}
++
+ function Invoke-Git {
+     [CmdletBinding()]
+     [OutputType([String])]
+@@ -245,37 +401,90 @@ function Invoke-Git {
+         $WorkingDirectory,
+         [Parameter(Mandatory = $true, Position = 1)]
+         [Alias('Args')]
++        [AllowEmptyString()]
+         [String[]]
+         $ArgumentList
+     )
+ 
+-    $proxy = get_config PROXY
++    $script:GitNetworkTimedOut = $false
+     $git = Get-HelperPath -Helper Git
++    $network = Test-GitNetworkCommand $ArgumentList
+ 
+     if ($WorkingDirectory) {
+         $ArgumentList = @('-C', $WorkingDirectory) + $ArgumentList
+     }
+ 
+-    if ([String]::IsNullOrEmpty($proxy) -or $proxy -eq 'none') {
+-        return & $git @ArgumentList
++    if (!$network) {
++        & $git @ArgumentList
++        $global:LASTEXITCODE = $LASTEXITCODE
++        return
+     }
+ 
+-    if ($ArgumentList -match '\b(clone|checkout|pull|fetch|ls-remote)\b') {
+-        $j = Start-Job -ScriptBlock {
+-            # convert proxy setting for git
+-            $proxy = $using:proxy
+-            if ($proxy -and $proxy.StartsWith('currentuser@')) {
+-                $proxy = $proxy.Replace('currentuser@', ':@')
++    $timeout = 120.0
++    $configuredTimeout = get_config git_network_timeout 120
++    if (![Double]::TryParse([String]$configuredTimeout, [ref]$timeout) -or
++        [Double]::IsNaN($timeout) -or [Double]::IsInfinity($timeout) -or $timeout -lt 0 -or $timeout -gt 2147483) {
++        throw 'git_network_timeout must be a non-negative number of seconds (maximum 2147483).'
++    }
++    $start = New-Object System.Diagnostics.ProcessStartInfo
++    $start.FileName = $git
++    $start.WorkingDirectory = $ExecutionContext.SessionState.Path.CurrentFileSystemLocation.ProviderPath
++    $start.Arguments = ConvertTo-GitCommandLine $ArgumentList
++    $start.UseShellExecute = $false
++    $start.CreateNoWindow = $true
++    $start.RedirectStandardOutput = $true
++    $start.RedirectStandardError = $true
++    $proxy = get_config PROXY
++    if ($proxy -and $proxy -ne 'none') {
++        if ($proxy.StartsWith('currentuser@')) { $proxy = $proxy.Replace('currentuser@', ':@') }
++        $start.EnvironmentVariables['HTTPS_PROXY'] = $proxy
++        $start.EnvironmentVariables['HTTP_PROXY'] = $proxy
++    }
++    Initialize-GitNetworkJob
++    $job = [ScoopGitNetworkJob]::CreateJobObject([IntPtr]::Zero, $null)
++    if ($job -eq [IntPtr]::Zero) { throw 'Unable to create the isolated Git process job.' }
++    $process = $null
++    $exitCode = 1
++    $watch = [System.Diagnostics.Stopwatch]::StartNew()
++    try {
++        $process = [ScoopGitNetworkJob]::Start($start, $job)
++        $stdout = $process.StandardOutput.ReadToEndAsync()
++        $stderr = $process.StandardError.ReadToEndAsync()
++        do {
++            if ($process.HasExited -and $stdout.IsCompleted -and $stderr.IsCompleted) { break }
++            if ($timeout -gt 0 -and $watch.Elapsed.TotalSeconds -ge $timeout) {
++                $script:GitNetworkTimedOut = $true
++                $exitCode = 124
++                Stop-GitProcessTree -Job $job
++                break
+             }
+-            $env:HTTPS_PROXY = $proxy
+-            $env:HTTP_PROXY = $proxy
+-            & $using:git @using:ArgumentList
++            Start-Sleep -Milliseconds 20
++        } while ($true)
++        if ($script:GitNetworkTimedOut) {
++            $exitCode = 124
++            Write-Warning "Git network operation timed out after $timeout seconds."
++        } else {
++            $exitCode = $process.ExitCode
++        }
++        if ($stdout.IsCompleted -and !$stdout.IsFaulted) {
++            $text = $stdout.Result
++            if ($text.Length) { ($text -replace '\r?\n$', '') -split '\r?\n' }
++        }
++        if ($stderr.IsCompleted -and !$stderr.IsFaulted) {
++            $text = $stderr.Result
++            if ($text.Length) { Write-Error -Message $text.TrimEnd("`r", "`n") -ErrorAction Continue }
++        }
++    } finally {
++        try {
++            if ($process) {
++                Stop-GitProcessTree -Job $job
++            }
++        } finally {
++            $null = [ScoopGitNetworkJob]::CloseHandle($job)
++            if ($process) { $process.Dispose() }
++            $global:LASTEXITCODE = $exitCode
+         }
+-        $o = $j | Receive-Job -Wait -AutoRemoveJob
+-        return $o
+     }
+-
+-    return & $git @ArgumentList
+ }
+ 
+ function Invoke-GitLog {
+@@ -1255,7 +1464,6 @@ function is_scoop_outdated() {
+         return ($expireHour -ge 3)
+     } catch {
+         # If not System.DateTime
+-        set_config LAST_UPDATE ($now.ToString('o')) | Out-Null
+         return $true
+     }
+ }
+diff --git a/lib/install.ps1 b/lib/install.ps1
+index 7b242278..573821c7 100644
+--- a/lib/install.ps1
++++ b/lib/install.ps1
+@@ -532,16 +532,30 @@ function persist_permission($manifest, $global) {
+ # test if there are running processes
+ function test_running_process($app, $global) {
+     $processdir = appdir $app $global | Convert-Path
+-    $running_processes = Get-Process | Where-Object { $_.Path -like "$processdir\*" } | Out-String
++    $processPrefix = $processdir.TrimEnd('\', '/') + '\'
++    $running_processes = @(Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($processPrefix, [StringComparison]::OrdinalIgnoreCase) })
+ 
+     if ($running_processes) {
++        if (get_config KILL_RUNNING_PROCESSES) {
++            warn "The following instances of `"$app`" are still running. Scoop is configured to stop them."
++            Write-Host ($running_processes | Out-String)
++            $running_processes | Stop-Process -Force -ErrorAction Stop
++            $running_processes | Wait-Process -Timeout 30 -ErrorAction SilentlyContinue
++            $remaining_processes = @(Get-Process | Where-Object { $_.Path -and $_.Path.StartsWith($processPrefix, [StringComparison]::OrdinalIgnoreCase) })
++            if (!$remaining_processes) {
++                return $false
++            }
++            error "The following instances of `"$app`" are still running after stop attempt. Close them and try again."
++            Write-Host ($remaining_processes | Out-String)
++            return $true
++        }
+         if (get_config IGNORE_RUNNING_PROCESSES) {
+             warn "The following instances of `"$app`" are still running. Scoop is configured to ignore this condition."
+-            Write-Host $running_processes
++            Write-Host ($running_processes | Out-String)
+             return $false
+         } else {
+             error "The following instances of `"$app`" are still running. Close them and try again."
+-            Write-Host $running_processes
++            Write-Host ($running_processes | Out-String)
+             return $true
+         }
+     } else {
+diff --git a/libexec/scoop-cleanup.ps1 b/libexec/scoop-cleanup.ps1
+index 3ea5194d..566cd310 100644
+--- a/libexec/scoop-cleanup.ps1
++++ b/libexec/scoop-cleanup.ps1
+@@ -9,17 +9,25 @@
+ #   -a, --all          Cleanup all apps (alternative to '*')
+ #   -g, --global       Cleanup a globally installed app
+ #   -k, --cache        Remove outdated download cache
++#   -n, --keep N       Keep current plus N-1 newest installed old versions (default: 1)
++#       --dry-run      Show the cleanup plan without changing files or processes
+ 
+ . "$PSScriptRoot\..\lib\getopt.ps1"
+ . "$PSScriptRoot\..\lib\manifest.ps1" # 'Select-CurrentVersion' (indirectly)
+ . "$PSScriptRoot\..\lib\versions.ps1" # 'Select-CurrentVersion'
+ . "$PSScriptRoot\..\lib\install.ps1" # persist related
+ 
+-$opt, $apps, $err = getopt $args 'agk' 'all', 'global', 'cache'
++$opt, $apps, $err = getopt $args 'agkn:' 'all', 'global', 'cache', 'keep=', 'dry-run'
+ if ($err) { error "scoop cleanup: $err"; exit 1 }
+ $global = $opt.g -or $opt.global
+ $cache = $opt.k -or $opt.cache
+ $all = $opt.a -or $opt.all
++$script:cleanupKeep = 1
++$script:cleanupDryRun = [bool]$opt.'dry-run'
++$keepArgument = if ($opt.ContainsKey('keep')) { $opt.keep } elseif ($opt.ContainsKey('n')) { $opt.n } else { '1' }
++if ([string]$keepArgument -notmatch '^[0-9]+$' -or ![int]::TryParse([string]$keepArgument, [ref]$script:cleanupKeep) -or $script:cleanupKeep -lt 1) {
++    error 'scoop cleanup: --keep must be a positive integer (1..2147483647)'; exit 1
++}
+ 
+ if (!$apps -and !$all) { error '<app> missing'; my_usage; exit 1 }
+ 
+@@ -27,38 +35,383 @@ if ($global -and !(is_admin)) {
+     error 'you need admin rights to cleanup global apps'; exit 1
+ }
+ 
+-function cleanup($app, $global, $verbose, $cache) {
+-    $current_version = Select-CurrentVersion -AppName $app -Global:$global
+-    if ($cache) {
+-        Remove-Item "$cachedir\$app#*" -Exclude "$app#$current_version#*"
++function Get-CleanupPath($path) {
++    if (![IO.Path]::IsPathRooted($path)) { throw "Cleanup requires an absolute filesystem path: $path" }
++    [IO.Path]::GetFullPath($path).TrimEnd('\', '/')
++}
++
++function Assert-CleanupVersionPath($dir, $appDir, $currentVersion) {
++    $path = Get-CleanupPath $dir
++    $parent = Get-CleanupPath $appDir
++    if ((Split-Path $path -Parent) -ne $parent -or (Split-Path $path -Leaf) -eq 'current' -or
++        !$currentVersion -or (Split-Path $path -Leaf) -eq $currentVersion) {
++        throw "Refusing unsafe or current version path: $path"
++    }
++    $ancestor = $path
++    while ($ancestor) {
++        $item = Get-Item -LiteralPath $ancestor -Force -ErrorAction Stop
++        if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Refusing a version path through a link: $ancestor" }
++        $ancestor = Split-Path $ancestor -Parent
++    }
++    $current = Get-Item -LiteralPath (Join-Path $parent 'current') -Force -ErrorAction SilentlyContinue
++    for ($depth = 0; $current -and ($current.Attributes -band [IO.FileAttributes]::ReparsePoint); $depth++) {
++        if ($depth -ge 32 -or !$current.Target -or @($current.Target).Count -ne 1) { throw 'Cannot safely resolve the current version link.' }
++        $target = [string]@($current.Target)[0]
++        if (![IO.Path]::IsPathRooted($target)) { $target = Join-Path (Split-Path $current.FullName -Parent) $target }
++        $target = Get-CleanupPath $target
++        if ($path -eq $target) { throw "Refusing the current link target: $path" }
++        $ancestor = Split-Path $target -Parent
++        while ($ancestor) {
++            $item = Get-Item -LiteralPath $ancestor -Force -ErrorAction Stop
++            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { throw "Cannot safely resolve the current target through a parent link: $ancestor" }
++            $ancestor = Split-Path $ancestor -Parent
++        }
++        $current = Get-Item -LiteralPath $target -Force -ErrorAction Stop
++    }
++    $path
++}
++
++function Unlink-CleanupData($manifest, $dir) {
++    foreach ($definition in @($manifest.persist)) {
++        if (!$definition) { continue }
++        $source, $null = persist_def $definition
++        $persistPath = Get-CleanupPath (Join-Path $dir $source)
++        if (!$persistPath.StartsWith($dir + '\', [StringComparison]::OrdinalIgnoreCase) -or
++            [Management.Automation.WildcardPattern]::ContainsWildcardCharacters($source)) {
++            throw "Refusing unsafe persist path: $source"
++        }
++        $persistItem = Get-Item -LiteralPath $persistPath -Force -ErrorAction SilentlyContinue
++        if ($persistItem -and !$persistItem.PSIsContainer -and ($persistItem.Attributes -band [IO.FileAttributes]::ReadOnly)) {
++            throw "Refusing to clear a potentially shared read-only persisted file attribute: $persistPath"
++        }
++    }
++    $pending = New-Object 'Collections.Generic.Stack[string]'
++    $pending.Push($dir)
++    while ($pending.Count) {
++        foreach ($item in Get-ChildItem -LiteralPath $pending.Pop() -Force -ErrorAction Stop) {
++            if (!$item.PSIsContainer) {
++                if ($item.LinkType -eq 'HardLink' -and ($item.Attributes -band [IO.FileAttributes]::ReadOnly)) {
++                    throw "Refusing to clear the shared read-only attribute of a hardlinked file: $($item.FullName)"
++                }
++                continue
++            }
++            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
++                if ($item.Attributes -band [IO.FileAttributes]::ReadOnly) {
++                    attrib -R /L $item.FullName
++                    if ($LASTEXITCODE) { throw "Cannot clear the junction's read-only attribute: $($item.FullName)" }
++                }
++                [IO.Directory]::Delete($item.FullName)
++            } else {
++                $pending.Push($item.FullName)
++            }
++        }
++    }
++    unlink_persist_data $manifest $dir
++}
++
++function Get-CleanupRestartManagerOwners($files) {
++    if (!('ScoopCleanup.Native.RestartManager' -as [type])) {
++        Add-Type -ErrorAction Stop -TypeDefinition @'
++using System;
++using System.ComponentModel;
++using System.Runtime.InteropServices;
++using System.Text;
++namespace ScoopCleanup.Native {
++    public sealed class Owner {
++        public int ProcessId;
++        public long StartTime;
++        public string AppName;
++        public string ServiceName;
++        public int AppType;
+     }
++    public static class RestartManager {
++        [StructLayout(LayoutKind.Sequential)]
++        private struct UniqueProcess { public uint ProcessId; public System.Runtime.InteropServices.ComTypes.FILETIME StartTime; }
++        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
++        private struct ProcessInfo {
++            public UniqueProcess Process;
++            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 256)] public string AppName;
++            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 64)] public string ServiceName;
++            public int AppType;
++            public uint AppStatus;
++            public uint SessionId;
++            [MarshalAs(UnmanagedType.Bool)] public bool Restartable;
++        }
++        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
++        private static extern int RmStartSession(out uint handle, uint flags, StringBuilder key);
++        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
++        private static extern int RmRegisterResources(uint handle, uint fileCount, string[] files,
++            uint processCount, UniqueProcess[] processes, uint serviceCount, string[] services);
++        [DllImport("rstrtmgr.dll", CharSet = CharSet.Unicode)]
++        private static extern int RmGetList(uint handle, out uint needed, ref uint count,
++            [In, Out] ProcessInfo[] processes, ref uint reasons);
++        [DllImport("rstrtmgr.dll")]
++        private static extern int RmEndSession(uint handle);
++        private static void Check(int code) {
++            if (code != 0) throw new Win32Exception(code, "Restart Manager error " + code + ": " + new Win32Exception(code).Message);
++        }
++        public static Owner[] FindOwners(string[] files) {
++            uint handle;
++            Check(RmStartSession(out handle, 0, new StringBuilder(33)));
++            try {
++                Check(RmRegisterResources(handle, (uint)files.Length, files, 0, null, 0, null));
++                uint needed, count = 0, reasons = 0;
++                int code = RmGetList(handle, out needed, ref count, null, ref reasons);
++                if (code == 0) return new Owner[0];
++                if (code != 234) Check(code);
++                for (int attempt = 0; attempt < 2; attempt++) {
++                    if (needed > 256) throw new InvalidOperationException("Restart Manager owner limit exceeded (256).");
++                    ProcessInfo[] entries = new ProcessInfo[needed];
++                    count = needed;
++                    code = RmGetList(handle, out needed, ref count, entries, ref reasons);
++                    if (code == 234) continue;
++                    Check(code);
++                    Owner[] owners = new Owner[count];
++                    for (int index = 0; index < count; index++) {
++                        ProcessInfo entry = entries[index];
++                        owners[index] = new Owner {
++                            ProcessId = (int)entry.Process.ProcessId,
++                            StartTime = ((long)(uint)entry.Process.StartTime.dwHighDateTime << 32) | (uint)entry.Process.StartTime.dwLowDateTime,
++                            AppName = entry.AppName, ServiceName = entry.ServiceName, AppType = entry.AppType
++                        };
++                    }
++                    return owners;
++                }
++                Check(code);
++                return new Owner[0];
++            } finally { RmEndSession(handle); }
++        }
++    }
++}
++'@ | Out-Null
++    }
++    [ScoopCleanup.Native.RestartManager]::FindOwners([string[]]$files)
++}
++
++function Get-CleanupFailureFiles($path, $failure) {
++    $files = New-Object 'Collections.Generic.List[string]'
++    $target = $failure.TargetObject
++    if ($target -is [IO.FileSystemInfo]) { $target = $target.FullName }
++    if ($target -is [string] -and $target) {
++        try {
++            if (![IO.Path]::IsPathRooted($target)) { $target = Join-Path $path $target }
++            $target = Get-CleanupPath $target
++            if ($target.StartsWith($path + '\', [StringComparison]::OrdinalIgnoreCase) -and (Test-Path -LiteralPath $target -PathType Leaf)) { $files.Add($target) }
++        } catch { }
++    }
++    $pending = New-Object 'Collections.Generic.Stack[string]'
++    $pending.Push($path)
++    $visited = 0
++    while ($pending.Count -and $files.Count -lt 32 -and $visited -lt 256) {
++        $directory = $pending.Pop()
++        try {
++            $entry = Get-Item -LiteralPath $directory -Force -ErrorAction Stop
++            if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
++            foreach ($entryPath in [IO.Directory]::EnumerateFileSystemEntries($directory)) {
++                $visited++
++                $item = Get-Item -LiteralPath $entryPath -Force -ErrorAction Stop
++                if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
++                if ($item.PSIsContainer) { $pending.Push($item.FullName) }
++                elseif (!$files.Contains($item.FullName)) { $files.Add($item.FullName) }
++                if ($files.Count -ge 32 -or $visited -ge 256) { break }
++            }
++        } catch { }
++    }
++    $files.ToArray()
++}
++
++function Write-CleanupOwner($owner) {
++    $name = $owner.AppName
++    $executable = 'unavailable'
++    $validated = $false
++    try {
++        $process = Get-Process -Id $owner.ProcessId -ErrorAction Stop
++        if ($process.StartTime.ToFileTimeUtc() -eq $owner.StartTime) {
++            $validated = $true
++            $name = $process.ProcessName
++            try { if ($process.Path) { $executable = $process.Path } } catch { }
++        }
++    } catch { }
++    warn "Possible owner via Restart Manager: PID $($owner.ProcessId); Process: $name; Executable: $executable; Application: $($owner.AppName); Service: $($owner.ServiceName)."
++    if (!$validated) {
++        warn 'The PID/start time could not be verified (the process may have exited or the PID may have been reused); no termination command is suggested.'
++    } elseif ($owner.ServiceName -or $owner.AppType -in @(3, 1000) -or $name -in @('System', 'Idle', 'Registry', 'Secure System', 'smss', 'csrss', 'wininit', 'winlogon', 'lsass', 'services', 'svchost')) {
++        warn 'This is a service or critical system process. No termination command is suggested; use the application/service management UI if appropriate.'
++    } else {
++        if ($owner.AppType -eq 4 -or $name -eq 'explorer') { warn 'Explorer provides the desktop and taskbar; stopping it interrupts the desktop session.' }
++        warn "Save work and close the application normally first. Optional manual command (not executed; re-check the PID before use): Stop-Process -Id $($owner.ProcessId)"
++    }
++}
++
++function Write-CleanupFailure($app, $version, $path, $failure, $inspectOwners = $false) {
++    $script:cleanupFailures++
++    warn "Cleanup failed for $app ($version), path '$path': $($failure.Exception.Message)"
++    if (!$inspectOwners) { return }
++    $files = @(Get-CleanupFailureFiles $path $failure)
++    $reason = 'No readable remaining files were found within the bounded scan (32 files / 256 entries).'
++    if ($files.Count) {
++        try {
++            $nativeOwners = @(Get-CleanupRestartManagerOwners $files)
++            if ($nativeOwners.Count) {
++                foreach ($owner in $nativeOwners) { Write-CleanupOwner $owner }
++                return
++            }
++            $reason = "Restart Manager returned no owners for $($files.Count) file(s)."
++        } catch { $reason = $_.Exception.Message }
++    }
++    $owners = @()
++    $timer = [Diagnostics.Stopwatch]::StartNew()
++    $inspected = 0
++    try {
++        foreach ($process in Get-Process -ErrorAction Stop) {
++            if ($inspected -ge 128 -or $timer.ElapsedMilliseconds -ge 2000) { break }
++            $inspected++
++            try {
++                foreach ($module in $process.Modules) {
++                    if ($timer.ElapsedMilliseconds -ge 2000) { break }
++                    if ($module.FileName.StartsWith($path + '\', [StringComparison]::OrdinalIgnoreCase)) {
++                        $executable = 'unavailable'
++                        try { if ($process.Path) { $executable = $process.Path } } catch { }
++                        $owners += "$($process.ProcessName) (PID $($process.Id)); Executable: $executable"
++                        break
++                    }
++                }
++            } catch { }
++        }
++    } catch { }
++    warn "Exact file owner unknown: $reason File locks, permissions, or other errors may prevent deletion."
++    if ($owners) { warn "Possible owners via loaded modules (not proof of a lock; no kill advice): $($owners -join ', ')" }
++}
++
++function Get-CleanupKeep($keep) {
++    $count = 0
++    if ([string]$keep -notmatch '^[0-9]+$' -or ![int]::TryParse([string]$keep, [ref]$count) -or $count -lt 1) {
++        throw '--keep must be a positive integer (1..2147483647)'
++    }
++    return $count
++}
++
++function Get-CleanupVersionPlan($app, $global, $keep = 1) {
++    $count = Get-CleanupKeep $keep
++    $current = Select-CurrentVersion -AppName $app -Global:$global
++    if (!$current) { throw 'Cannot safely plan cleanup without the current version.' }
+     $appDir = appdir $app $global
+-    $versions = Get-ChildItem $appDir -Name
+-    $versions = $versions | Where-Object { $current_version -ne $_ -and $_ -ne 'current' }
+-    if (!$versions) {
+-        if ($verbose) { success "$app is already clean" }
+-        return
++    $retained = @($current)
++    $installed = @()
++    if ($count -gt 1) {
++        $installed = @(Get-InstalledVersion -AppName $app -Global:$global | Where-Object { $_ -ne $current })
++        $retained += @($installed | Select-Object -Last ($count - 1))
++    }
++    $decisions = @(foreach ($item in Get-ChildItem -LiteralPath $appDir -ErrorAction Stop | Sort-Object Name) {
++        if ($item.Name -eq 'current') { continue }
++        $reason = 'outside retained installation count'
++        $remove = $true
++        if ($retained -contains $item.Name) {
++            $remove = $false
++            $reason = if ($item.Name -eq $current) { 'current version (always protected)' } else { 'recent installation within --keep count' }
++        } elseif ($count -gt 1 -and $installed -notcontains $item.Name) {
++            $remove = $false
++            $retained += $item.Name
++            $reason = 'unrecognized or backup directory; installation chronology unknown'
++        }
++        [pscustomobject]@{ Version = $item.Name; Path = $item.FullName; Remove = $remove; Reason = $reason }
++    })
++    [pscustomobject]@{ Current = $current; AppDir = $appDir; Retained = $retained; Decisions = $decisions }
++}
++
++function Invoke-CleanupCachePlan($app, $pattern, $exclude, $dryRun, $reason) {
++    $candidates = @()
++    if (Test-Path -LiteralPath $cachedir) {
++        foreach ($item in Get-ChildItem -LiteralPath $cachedir -Force -ErrorAction Stop | Sort-Object Name) {
++            if ($item.PSIsContainer) {
++                continue
++            }
++            if ($item.Name -notlike $pattern) { continue }
++            $protected = $false
++            foreach ($exclusion in $exclude) { if ($item.Name -like $exclusion) { $protected = $true; break } }
++            if ($protected) {
++                Write-Host "KEEP $app cache '$($item.FullName)': retained version or separately planned download remnant"
++            } else {
++                Write-Host "DELETE $app cache '$($item.FullName)': $reason"
++                $candidates += $item.FullName
++            }
++        }
++    }
++    if (!$dryRun) {
++        foreach ($path in $candidates) {
++            try { Remove-Item -LiteralPath $path -ErrorAction Stop }
++            catch { Write-CleanupFailure $app 'cache' $path $_ }
++        }
++    }
++}
++
++function cleanup($app, $global, $verbose, $cache, $keep = 1, $dryRun = $false, $plan = $null) {
++    if (!$plan) { $plan = Get-CleanupVersionPlan $app $global $keep }
++    $exclusions = @($script:cleanupCacheExclusions)
++    $exclusions += @($plan.Retained | ForEach-Object { [Management.Automation.WildcardPattern]::Escape("$app#$_#") + '*' })
++    if ($cache) {
++        try { Invoke-CleanupCachePlan $app ([Management.Automation.WildcardPattern]::Escape("$app#") + '*') @($exclusions + '*.download') $dryRun 'outdated version cache' }
++        catch { Write-CleanupFailure $app 'cache' $cachedir $_ }
++    }
++    foreach ($decision in $plan.Decisions) {
++        $version = $decision.Version
++        $dir = $decision.Path
++        if (!$decision.Remove) {
++            Write-Host "KEEP $app $version '$dir': $($decision.Reason)"
++            continue
++        }
++        $inspectOwners = $false
++        try {
++            $dir = versiondir $app $version $global
++            $dir = Assert-CleanupVersionPath $dir $plan.AppDir $plan.Current
++            Write-Host "DELETE $app $version '$dir': $($decision.Reason)"
++            if ($dryRun) { continue }
++            $inspectOwners = $true
++            Unlink-CleanupData (installed_manifest $app $version $global) $dir
++            $dir = Assert-CleanupVersionPath $dir $plan.AppDir $plan.Current
++            Remove-Item -LiteralPath $dir -ErrorAction Stop -Recurse -Force
++        } catch {
++            Write-CleanupFailure $app $version $dir $_ $inspectOwners
++        }
+     }
++    if (!$dryRun) {
++        $leftVersions = Get-ChildItem -LiteralPath $plan.AppDir -Force -ErrorAction Stop
++        if (!$leftVersions) { Remove-Item -LiteralPath $plan.AppDir -ErrorAction Stop -Force }
++    }
++    if ($verbose -and !@($plan.Decisions | Where-Object Remove).Count) { success "$app is already clean" }
++}
+ 
+-    Write-Host -f yellow "Removing $app`:" -NoNewline
+-    $versions | ForEach-Object {
+-        $version = $_
+-        Write-Host " $version" -NoNewline
+-        $dir = versiondir $app $version $global
+-        # unlink all potential old link before doing recursive Remove-Item
+-        unlink_persist_data (installed_manifest $app $version $global) $dir
+-        Remove-Item $dir -ErrorAction Stop -Recurse -Force
++function Invoke-CleanupApps($apps, $verbose, $cache, $keep = $(if ($script:cleanupKeep) { $script:cleanupKeep } else { 1 }), $dryRun = $script:cleanupDryRun) {
++    $keep = Get-CleanupKeep $keep
++    $script:cleanupFailures = 0
++    $script:cleanupCacheExclusions = @()
++    $work = @()
++    foreach ($entry in $apps) {
++        try {
++            $plan = Get-CleanupVersionPlan $entry[0] $entry[1] $keep
++            $script:cleanupCacheExclusions += @($plan.Retained | ForEach-Object { [Management.Automation.WildcardPattern]::Escape("$($entry[0])#$_#") + '*' })
++            $work += [pscustomobject]@{ App = $entry[0]; Global = $entry[1]; Plan = $plan }
++        } catch {
++            $script:cleanupCacheExclusions += [Management.Automation.WildcardPattern]::Escape("$($entry[0])#") + '*'
++            Write-CleanupFailure $entry[0] 'app' (appdir $entry[0] $entry[1]) $_
++        }
++    }
++    if ($dryRun) { warn 'Dry run: file locks and permissions are unknown; no deletion probe, persist unlink, attribute change or process action is performed.' }
++    foreach ($entry in $work) {
++        try { cleanup $entry.App $entry.Global $verbose $cache $keep $dryRun $entry.Plan }
++        catch { Write-CleanupFailure $entry.App 'app' $entry.Plan.AppDir $_ }
+     }
+-    $leftVersions = Get-ChildItem $appDir
+-    if ($leftVersions.Length -eq 1 -and $leftVersions.Name -eq 'current' -and $leftVersions.LinkType) {
+-        attrib $leftVersions.FullName -R /L
+-        Remove-Item $leftVersions.FullName -ErrorAction Stop -Force
+-        $leftVersions = $null
++    if ($cache) {
++        try { Invoke-CleanupCachePlan 'cache' '*.download' $script:cleanupCacheExclusions $dryRun 'incomplete download remnant' }
++        catch { Write-CleanupFailure 'cache' 'downloads' $cachedir $_ }
+     }
+-    if (!$leftVersions) {
+-        Remove-Item $appDir -ErrorAction Stop -Force
++    if ($script:cleanupFailures) {
++        warn "Cleanup incomplete: $script:cleanupFailures operation(s) failed. Other apps and versions were still processed."
++        return 1
+     }
+-    Write-Host ''
++    if ($dryRun) { success 'Cleanup preview complete; nothing changed.' }
++    elseif (!$verbose) { success 'Everything is shiny now!' }
++    return 0
+ }
+ 
+ if ($apps -or $all) {
+@@ -74,15 +427,7 @@ if ($apps -or $all) {
+     }
+ 
+     # $apps is now a list of ($app, $global) tuples
+-    $apps | ForEach-Object { cleanup @_ $verbose $cache }
+-
+-    if ($cache) {
+-        Remove-Item "$cachedir\*.download" -ErrorAction Ignore
+-    }
+-
+-    if (!$verbose) {
+-        success 'Everything is shiny now!'
+-    }
++    exit (Invoke-CleanupApps $apps $verbose $cache)
+ }
+ 
+ exit 0
+diff --git a/libexec/scoop-config.ps1 b/libexec/scoop-config.ps1
+index a2d1cb37..2740ee51 100644
+--- a/libexec/scoop-config.ps1
++++ b/libexec/scoop-config.ps1
+@@ -108,6 +108,19 @@
+ #       any target app process is running. Procedure here refers to reset/uninstall/update.
+ #       When set to $true, Scoop only displays a warning message and continues procedure.
+ #
++# kill_running_processes: $true|$false
++#       When set to $true, Scoop force-stops running target app processes before reset/uninstall/update.
++#       Updates download and validate the new version before stopping the old app.
++#       This local extension takes precedence over ignore_running_processes.
++#
++# operation_lock_timeout: number
++#       Maximum seconds to wait for another modifying Scoop operation (default 30).
++#       Zero fails immediately when busy. Read-only commands and cleanup --dry-run do not acquire a lock.
++#
++# git_network_timeout: number
++#       Maximum wall-clock seconds for clone/fetch/pull/ls-remote (default 120).
++#       Zero disables the deadline. Timed-out operations fail without resetting local changes.
++#
+ # private_hosts:
+ #       Array of private hosts that need additional authentication.
+ #       For example, if you want to access a private GitHub repository,
+diff --git a/libexec/scoop-update.ps1 b/libexec/scoop-update.ps1
+index 387ae4e0..ae6c5a57 100644
+--- a/libexec/scoop-update.ps1
++++ b/libexec/scoop-update.ps1
+@@ -68,6 +68,7 @@ function Sync-Scoop {
+     )
+     # Test if Scoop Core is hold
+     if (Test-ScoopCoreOnHold) {
++        $global:LASTEXITCODE = 0
+         return
+     }
+ 
+@@ -82,6 +83,7 @@ function Sync-Scoop {
+ 
+         # get git scoop
+         Invoke-Git -ArgumentList @('clone', '-q', $configRepo, '--branch', $configBranch, '--single-branch', $newdir)
++        if ($LASTEXITCODE -ne 0) { abort 'Scoop download failed.' }
+ 
+         # check if scoop was successful downloaded
+         if (!(Test-Path "$newdir\bin\scoop.ps1")) {
+@@ -116,6 +118,7 @@ function Sync-Scoop {
+                 Invoke-Git -Path $currentdir -ArgumentList @('stash', 'push', '-m', "WIP at $([System.DateTime]::Now.ToString('o'))", '-u', '-q')
+             } else {
+                 warn 'Uncommitted changes detected. Update aborted.'
++                $global:LASTEXITCODE = 1
+                 return
+             }
+         }
+@@ -131,6 +134,7 @@ function Sync-Scoop {
+             Invoke-Git -Path $currentdir -ArgumentList @('config', 'remote.origin.fetch', '+refs/heads/*:refs/remotes/origin/*')
+             # fetch remote branch
+             Invoke-Git -Path $currentdir -ArgumentList @('fetch', '--force', 'origin', "refs/heads/$configBranch`:refs/remotes/origin/$configBranch", '-q')
++            if ($LASTEXITCODE -ne 0) { abort 'Update failed.' }
+             # checkout and track the branch
+             Invoke-Git -Path $currentdir -ArgumentList @('checkout', '-B', $configBranch, '-t', "origin/$configBranch", '-q')
+             # reset branch HEAD
+@@ -150,6 +154,7 @@ function Sync-Scoop {
+     }
+ 
+     shim "$currentdir\bin\scoop.ps1" $false
++    $global:LASTEXITCODE = 0
+ }
+ 
+ function Sync-Bucket {
+@@ -157,21 +162,25 @@ function Sync-Bucket {
+         [Switch]$Log
+     )
+     Write-Host 'Updating Buckets...'
++    $failedBuckets = [System.Collections.ArrayList]::Synchronized([System.Collections.ArrayList]::new())
++    $skipMain = $false
+ 
+     if (!(Test-Path (Join-Path (Find-BucketDirectory 'main' -Root) '.git'))) {
+-        info "Converting 'main' bucket to git repo..."
+-        $status = rm_bucket 'main'
+-        if ($status -ne 0) {
+-            abort "Failed to remove local 'main' bucket."
+-        }
+-        $status = add_bucket 'main' (known_bucket_repo 'main')
+-        if ($status -ne 0) {
+-            abort "Failed to add remote 'main' bucket."
++        try {
++            info "Converting 'main' bucket to git repo..."
++            $status = rm_bucket 'main'
++            if ($status -ne 0) { throw 'Local main bucket removal failed.' }
++            $status = add_bucket 'main' (known_bucket_repo 'main')
++            if ($status -ne 0) { throw 'Remote main bucket creation failed.' }
++        } catch {
++            $skipMain = $true
++            [void]$failedBuckets.Add("main: repository conversion failed")
+         }
+     }
+ 
+ 
+     $buckets = Get-LocalBucket | ForEach-Object {
++        if ($skipMain -and $_ -eq 'main') { return }
+         $path = Find-BucketDirectory $_ -Root
+         return @{
+             name  = $_
+@@ -187,67 +196,96 @@ function Sync-Bucket {
+     if ($PSVersionTable.PSVersion.Major -ge 7) {
+         # Parallel parameter is available since PowerShell 7
+         $buckets | Where-Object { $_.valid } | ForEach-Object -ThrottleLimit 5 -Parallel {
+-            . "$using:PSScriptRoot\..\lib\core.ps1"
+-            . "$using:PSScriptRoot\..\lib\buckets.ps1"
+-
+             $name = $_.name
+-            $bucketLoc = $_.path
+-            $innerBucketLoc = Find-BucketDirectory $name
++            try {
++                . "$using:PSScriptRoot\..\lib\core.ps1"
++                . "$using:PSScriptRoot\..\lib\buckets.ps1"
+ 
+-            $previousCommit = Invoke-Git -Path $bucketLoc -ArgumentList @('rev-parse', 'HEAD')
+-            Invoke-Git -Path $bucketLoc -ArgumentList @('pull', '-q')
+-            if ($using:Log) {
+-                Invoke-GitLog -Path $bucketLoc -Name $name -CommitHash $previousCommit
+-            }
+-            if (get_config USE_SQLITE_CACHE) {
+-                Invoke-Git -Path $bucketLoc -ArgumentList @('diff', '--name-status', $previousCommit) | ForEach-Object {
+-                    $status, $file = $_ -split '\s+', 2
+-                    $filePath = Join-Path $bucketLoc $file
+-                    if ($filePath -match "^$([regex]::Escape($innerBucketLoc)).*\.json$") {
+-                        switch ($status) {
+-                            { $_ -in 'A', 'M', 'R' } {
+-                                [void]($using:updatedFiles).Add($filePath)
+-                            }
+-                            'D' {
+-                                [void]($using:removedFiles).Add([pscustomobject]@{
+-                                        Name   = ([System.IO.FileInfo]$file).BaseName
+-                                        Bucket = $name
+-                                    })
++                $name = $_.name
++                $bucketLoc = $_.path
++                $innerBucketLoc = Find-BucketDirectory $name
++
++                $previousCommit = Invoke-Git -Path $bucketLoc -ArgumentList @('rev-parse', 'HEAD')
++                if ($LASTEXITCODE -ne 0) {
++                    [void]($using:failedBuckets).Add("${name}: revision lookup failed (exit $LASTEXITCODE)")
++                    return
++                }
++                Invoke-Git -Path $bucketLoc -ArgumentList @('pull', '-q')
++                $gitExit = $LASTEXITCODE
++                if ($gitExit -ne 0) {
++                    $reason = if ($script:GitNetworkTimedOut) { 'network operation timed out' } else { "Git failed (exit $gitExit)" }
++                    [void]($using:failedBuckets).Add("${name}: $reason")
++                    return
++                }
++                if ($using:Log) {
++                    Invoke-GitLog -Path $bucketLoc -Name $name -CommitHash $previousCommit
++                }
++                if (get_config USE_SQLITE_CACHE) {
++                    Invoke-Git -Path $bucketLoc -ArgumentList @('diff', '--name-status', $previousCommit) | ForEach-Object {
++                        $status, $file = $_ -split '\s+', 2
++                        $filePath = Join-Path $bucketLoc $file
++                        if ($filePath -match "^$([regex]::Escape($innerBucketLoc)).*\.json$") {
++                            switch ($status) {
++                                { $_ -in 'A', 'M', 'R' } {
++                                    [void]($using:updatedFiles).Add($filePath)
++                                }
++                                'D' {
++                                    [void]($using:removedFiles).Add([pscustomobject]@{
++                                            Name   = ([System.IO.FileInfo]$file).BaseName
++                                            Bucket = $name
++                                        })
++                                }
+                             }
+                         }
+                     }
+                 }
++            } catch {
++                [void]($using:failedBuckets).Add("${name}: synchronization failed")
+             }
+         }
+     } else {
+         $buckets | Where-Object { $_.valid } | ForEach-Object {
+             $name = $_.name
+-            $bucketLoc = $_.path
+-            $innerBucketLoc = Find-BucketDirectory $name
++            try {
++                $bucketLoc = $_.path
++                $innerBucketLoc = Find-BucketDirectory $name
+ 
+-            $previousCommit = Invoke-Git -Path $bucketLoc -ArgumentList @('rev-parse', 'HEAD')
+-            Invoke-Git -Path $bucketLoc -ArgumentList @('pull', '-q')
+-            if ($Log) {
+-                Invoke-GitLog -Path $bucketLoc -Name $name -CommitHash $previousCommit
+-            }
+-            if (get_config USE_SQLITE_CACHE) {
+-                Invoke-Git -Path $bucketLoc -ArgumentList @('diff', '--name-status', $previousCommit) | ForEach-Object {
+-                    $status, $file = $_ -split '\s+', 2
+-                    $filePath = Join-Path $bucketLoc $file
+-                    if ($filePath -match "^$([regex]::Escape($innerBucketLoc)).*\.json$") {
+-                        switch ($status) {
+-                            { $_ -in 'A', 'M', 'R' } {
+-                                [void]($updatedFiles).Add($filePath)
+-                            }
+-                            'D' {
+-                                [void]($removedFiles).Add([pscustomobject]@{
+-                                        Name   = ([System.IO.FileInfo]$file).BaseName
+-                                        Bucket = $name
+-                                    })
++                $previousCommit = Invoke-Git -Path $bucketLoc -ArgumentList @('rev-parse', 'HEAD')
++                if ($LASTEXITCODE -ne 0) {
++                    [void]$failedBuckets.Add("${name}: revision lookup failed (exit $LASTEXITCODE)")
++                    return
++                }
++                Invoke-Git -Path $bucketLoc -ArgumentList @('pull', '-q')
++                $gitExit = $LASTEXITCODE
++                if ($gitExit -ne 0) {
++                    $reason = if ($script:GitNetworkTimedOut) { 'network operation timed out' } else { "Git failed (exit $gitExit)" }
++                    [void]$failedBuckets.Add("${name}: $reason")
++                    return
++                }
++                if ($Log) {
++                    Invoke-GitLog -Path $bucketLoc -Name $name -CommitHash $previousCommit
++                }
++                if (get_config USE_SQLITE_CACHE) {
++                    Invoke-Git -Path $bucketLoc -ArgumentList @('diff', '--name-status', $previousCommit) | ForEach-Object {
++                        $status, $file = $_ -split '\s+', 2
++                        $filePath = Join-Path $bucketLoc $file
++                        if ($filePath -match "^$([regex]::Escape($innerBucketLoc)).*\.json$") {
++                            switch ($status) {
++                                { $_ -in 'A', 'M', 'R' } {
++                                    [void]($updatedFiles).Add($filePath)
++                                }
++                                'D' {
++                                    [void]($removedFiles).Add([pscustomobject]@{
++                                            Name   = ([System.IO.FileInfo]$file).BaseName
++                                            Bucket = $name
++                                        })
++                                }
+                             }
+                         }
+                     }
+                 }
++            } catch {
++                [void]$failedBuckets.Add("${name}: synchronization failed")
+             }
+         }
+     }
+@@ -256,6 +294,12 @@ function Sync-Bucket {
+         Set-ScoopDB -Path $updatedFiles
+         $removedFiles | Remove-ScoopDBItem
+     }
++    if ($failedBuckets.Count) {
++        warn ("Bucket synchronization incomplete: {0} failed. {1}" -f $failedBuckets.Count, (($failedBuckets | Sort-Object) -join '; '))
++        $global:LASTEXITCODE = 1
++    } else {
++        $global:LASTEXITCODE = 0
++    }
+ }
+ 
+ function update($app, $global, $force = $false, $quiet = $false, $independent, $suggested, $use_cache = $true, $check_hash = $true) {
+@@ -303,13 +347,6 @@ function update($app, $global, $force = $false, $quiet = $false, $independent, $
+ 
+     Write-Host "Updating '$app' ($old_version -> $version)"
+ 
+-    #region Workaround for #2952
+-    if (test_running_process $app $global) {
+-        Write-Host 'Running process detected, skip updating.'
+-        return
+-    }
+-    #endregion Workaround for #2952
+-
+     # region Workaround
+     # Workaround for https://github.com/ScoopInstaller/Scoop/issues/2220 until install is refactored
+     # Remove and replace whole region after proper fix
+@@ -345,6 +382,12 @@ function update($app, $global, $force = $false, $quiet = $false, $independent, $
+     $check_hash = $false
+     # endregion Workaround
+ 
++    # Keep the app running until downloads and hash validation have succeeded.
++    if (test_running_process $app $global) {
++        Write-Host 'Running process detected, skip updating.'
++        return
++    }
++
+     $dir = versiondir $app $old_version $global
+     $persist_dir = persistdir $app $global
+ 
+@@ -404,7 +447,9 @@ if (-not ($apps -or $all)) {
+         exit 1
+     }
+     Sync-Scoop -Log:$show_update_log
++    if ($LASTEXITCODE -ne 0) { exit 1 }
+     Sync-Bucket -Log:$show_update_log
++    if ($LASTEXITCODE -ne 0) { exit 1 }
+     set_config LAST_UPDATE ([System.DateTime]::Now.ToString('o')) | Out-Null
+     success 'Scoop was updated successfully!'
+ } else {
+@@ -419,7 +464,9 @@ if (-not ($apps -or $all)) {
+ 
+     if ($updateScoop) {
+         Sync-Scoop -Log:$show_update_log
++        if ($LASTEXITCODE -ne 0) { exit 1 }
+         Sync-Bucket -Log:$show_update_log
++        if ($LASTEXITCODE -ne 0) { exit 1 }
+         set_config LAST_UPDATE ([System.DateTime]::Now.ToString('o')) | Out-Null
+         success 'Scoop was updated successfully!'
+     }
